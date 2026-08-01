@@ -1,0 +1,76 @@
+# Python: bytecode y cachés
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Empaquetado y distribución
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# PyInstaller / Nuitka
+*.manifest
+*.build/
+*.dist/
+*.onefile-build/
+
+# IDE y editores
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Registros y archivos temporales
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+~$*
+
+# Adquisiciones y proyectos locales grandes
+*.bin
+*.slg
+*.mlg
+*.dat
+*.mat
+*.oscproj
+captures/
+projects/
+
+# Exportaciones generadas por la aplicación
+exports/
+reports/
+screenshots/
+
+# Mantener los datos sintéticos versionables de examples/
+!examples/
+!examples/*.csv
+
+# Resultados de benchmarks y perfiles
+benchmarks/results/
+*.prof
+*.lprof
+*.trace
