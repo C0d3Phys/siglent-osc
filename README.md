@@ -24,7 +24,12 @@ OSC App convierte capturas extensas del osciloscopio en una experiencia de anál
 - Activación independiente de canales y modo `Solo`.
 - Configuración de atenuación de sonda por canal, desde 0.01X hasta 1000X.
 - Cursores X1/X2 y Y1/Y2 con colocación guiada.
+- Referencia de ciclo motor 0°–720°, cuatro etapas coloreadas, grados y RPM.
+- Tabla superpuesta exportable con 0°, 720°, duración, RPM y etapa inicial.
+- Modo compresímetro calibrable en PSI por rango de voltaje, presión y factor del sensor.
+- Presión mínima/máxima del ciclo, ángulo del pico y máximo de cada etapa.
 - Región de medición y estadísticas por canal.
+- Frecuencia automática y Duty+ por canal con umbral medio e histéresis 40/60 %.
 - Tablas superpuestas de cursores y estadísticas.
 - Exportación PNG incluyendo cursores y mediciones visibles.
 
@@ -96,13 +101,22 @@ Los BIN reales, proyectos y capturas de trabajo están excluidos por `.gitignore
 | Acercar o alejar tiempo | Rueda sobre la gráfica |
 | Acercar o alejar voltaje | `Ctrl + rueda` |
 | Colocar cursores | Activar X o Y y hacer dos clics |
+| Medir Freq y Duty+ | Consultar la tabla de estadísticas; usa la región X1–X2 si está activa |
 | Mover cursores | Arrastrar después de colocarlos |
 | Mover texto Y1/Y2 | Arrastrar la etiqueta de voltaje a lo largo de su línea |
 | Mover tablas superpuestas | Arrastrar la tabla con el botón izquierdo |
+| Analizar ciclo motor | Pulsar `Marcar 0° y 720°` y señalar ambos puntos |
+| Medir ángulos | Definir el ciclo y colocar los cursores verticales X1/X2 |
+| Cambiar el orden del ciclo | Elegir la etapa que comienza en 0° |
+| Medir presión | Configurar el rango del sensor y activar `Mostrar y medir en PSI` |
 | Corregir voltaje real | Ajustar `Sonda` en el panel de canales |
 | Opciones de gráfica | Clic derecho |
 | Guardar imagen | `Ctrl + S` |
 | Abrir adquisición | `Ctrl + O` |
+
+La conversión del compresímetro usa los dos puntos de calibración del sensor:
+`voltaje mínimo → PSI mínimo` y `voltaje máximo → PSI máximo`. El factor del sensor
+permite aplicar una corrección adicional sin modificar las muestras originales.
 
 ## Calidad y pruebas
 

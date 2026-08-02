@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from osc_app.core.csv_importer import CsvImportError, GenericCsvImporter
 from osc_app.core.measurements import (
+    calculate_pulse_measurements,
     calculate_statistics,
     inclusive_region_indices,
     nearest_index,
@@ -37,19 +39,39 @@ from osc_app.core.models import Acquisition
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
 
 CHANNEL_COLORS = ("#ffd43b", "#4dabf7", "#ff6b6b", "#69db7c")
-STATISTIC_COLUMNS = ("Canal", "Mínimo", "Máximo", "Pico-pico", "Media", "RMS", "N")
+STATISTIC_COLUMNS = (
+    "Canal",
+    "Mínimo",
+    "Máximo",
+    "Pico-pico",
+    "Media",
+    "RMS",
+    "Freq",
+    "Duty+",
+    "N",
+)
 CURSOR_VALUE_COLUMNS = ("Canal", "En X1", "En X2", "Diferencia")
 CURSOR_ROWS = (
     "X1",
     "X2",
     "Δt",
-    "Frecuencia",
+    "1/Δt",
+    "X1 (grados)",
+    "X2 (grados)",
+    "Δ grados",
     "Índice X1",
     "Índice X2",
     "Muestras",
     "Y1",
     "Y2",
     "ΔY",
+)
+
+ENGINE_PHASES = (
+    ("Trabajo", (225, 70, 70, 38)),
+    ("Escape", (130, 130, 130, 34)),
+    ("Admisión", (70, 165, 205, 34)),
+    ("Compresión", (245, 205, 45, 34)),
 )
 
 
@@ -141,13 +163,18 @@ class MainWindow(QMainWindow):
         self._plot_items: list[pg.PlotDataItem] = []
         self._channel_checks: list[QCheckBox] = []
         self._native_probe_factors: list[float] = []
+        self._applied_probe_factors: list[float] = []
         self._probe_controls: list[QDoubleSpinBox] = []
         self._placing_cursor: str | None = None
         self._show_cursor_overlay = True
         self._show_stats_overlay = True
+        self._pressure_mode_active = False
+        self._cycle_reference: tuple[float, float] | None = None
+        self._pending_cycle_start: float | None = None
         self._overlay_positions = {
             "cursor": (0.988, 0.975),
             "stats": (0.012, 0.025),
+            "cycle": (0.5, 0.975),
         }
         self._build_ui()
         self._build_menu()
@@ -201,7 +228,7 @@ class MainWindow(QMainWindow):
         upper_splitter.addWidget(channel_panel)
         upper_splitter.addWidget(graph_panel)
         upper_splitter.addWidget(cursor_panel)
-        upper_splitter.setSizes([220, 760, 330])
+        upper_splitter.setSizes([290, 720, 350])
         upper_splitter.setStretchFactor(1, 1)
 
         self.statistics = QTableWidget(0, len(STATISTIC_COLUMNS))
@@ -289,6 +316,9 @@ class MainWindow(QMainWindow):
         self.plot.addItem(self.cursor_x2, ignoreBounds=True)
         self.plot.addItem(self.cursor_y1, ignoreBounds=True)
         self.plot.addItem(self.cursor_y2, ignoreBounds=True)
+        self.region.hide()
+        self.cursor_x1.hide()
+        self.cursor_x2.hide()
         self.cursor_y1.hide()
         self.cursor_y2.hide()
         self.cursor_x1.sigPositionChanged.connect(self._x_cursor_dragged)
@@ -299,6 +329,32 @@ class MainWindow(QMainWindow):
         self.cursor_y2.sigPositionChanged.connect(self._refresh_measurements)
         self.region.sigRegionChanged.connect(self._region_dragged)
         self.region.sigRegionChangeFinished.connect(self._region_finished)
+
+        self._phase_regions: list[pg.LinearRegionItem] = []
+        self._phase_labels: list[pg.TextItem] = []
+        for phase_name, color in ENGINE_PHASES:
+            phase_region = pg.LinearRegionItem(
+                values=(0, 1),
+                orientation=pg.LinearRegionItem.Vertical,
+                brush=pg.mkBrush(*color),
+                pen=pg.mkPen(color[0], color[1], color[2], 100),
+                movable=False,
+            )
+            phase_region.setZValue(-20)
+            phase_region.hide()
+            phase_label = pg.TextItem(
+                text=phase_name,
+                anchor=(0.5, 0),
+                color=pg.mkColor(color[0], color[1], color[2]),
+                fill=pg.mkBrush(16, 20, 25, 205),
+                border=pg.mkPen(color[0], color[1], color[2], 150),
+            )
+            phase_label.setZValue(80)
+            phase_label.hide()
+            self._phase_regions.append(phase_region)
+            self._phase_labels.append(phase_label)
+            self.plot.addItem(phase_region, ignoreBounds=True)
+            self.plot.addItem(phase_label, ignoreBounds=True)
 
         self.cursor_overlay = DraggableTextItem(
             anchor=(1, 0),
@@ -314,8 +370,17 @@ class MainWindow(QMainWindow):
             moved_callback=lambda item: self._remember_overlay_position("stats", item),
         )
         self.stats_overlay.setZValue(100)
+        self.cycle_overlay = DraggableTextItem(
+            anchor=(0.5, 0),
+            fill=pg.mkBrush(24, 28, 34, 225),
+            border=pg.mkPen(110, 120, 135, 220),
+            moved_callback=lambda item: self._remember_overlay_position("cycle", item),
+        )
+        self.cycle_overlay.setZValue(100)
+        self.cycle_overlay.hide()
         self.plot.addItem(self.cursor_overlay, ignoreBounds=True)
         self.plot.addItem(self.stats_overlay, ignoreBounds=True)
+        self.plot.addItem(self.cycle_overlay, ignoreBounds=True)
 
     def _build_channel_panel(self) -> QWidget:
         panel = QGroupBox("Canales")
@@ -338,7 +403,50 @@ class MainWindow(QMainWindow):
         buttons.addWidget(show_all)
         buttons.addWidget(hide_all)
         layout.addLayout(buttons)
+
+        pressure_group = QGroupBox("Compresímetro")
+        pressure_layout = QFormLayout(pressure_group)
+        self.pressure_enabled = QCheckBox("Mostrar y medir en PSI")
+        self.pressure_channel = QComboBox()
+        self.pressure_voltage_min = self._pressure_spin(-1000.0, 1000.0, 0.0, " V")
+        self.pressure_voltage_max = self._pressure_spin(-1000.0, 1000.0, 5.0, " V")
+        self.pressure_min = self._pressure_spin(-100000.0, 100000.0, 0.0, " PSI")
+        self.pressure_max = self._pressure_spin(-100000.0, 100000.0, 500.0, " PSI")
+        self.pressure_gain = self._pressure_spin(0.001, 1000.0, 1.0, "×")
+        self.pressure_gain.setToolTip("Factor de corrección adicional para calibrar el sensor")
+        pressure_layout.addRow(self.pressure_enabled)
+        pressure_layout.addRow("Canal:", self.pressure_channel)
+        pressure_layout.addRow("Voltaje mínimo:", self.pressure_voltage_min)
+        pressure_layout.addRow("Voltaje máximo:", self.pressure_voltage_max)
+        pressure_layout.addRow("Presión mínima:", self.pressure_min)
+        pressure_layout.addRow("Presión máxima:", self.pressure_max)
+        pressure_layout.addRow("Factor sensor:", self.pressure_gain)
+        self.pressure_calibration = QLabel("Ganancia: 100 PSI/V")
+        self.pressure_calibration.setWordWrap(True)
+        pressure_layout.addRow(self.pressure_calibration)
+        self.pressure_enabled.toggled.connect(self._apply_pressure_configuration)
+        self.pressure_channel.currentIndexChanged.connect(self._apply_pressure_configuration)
+        for control in (
+            self.pressure_voltage_min,
+            self.pressure_voltage_max,
+            self.pressure_min,
+            self.pressure_max,
+            self.pressure_gain,
+        ):
+            control.valueChanged.connect(self._apply_pressure_configuration)
+        layout.addWidget(pressure_group)
         return panel
+
+    @staticmethod
+    def _pressure_spin(
+        minimum: float, maximum: float, value: float, suffix: str
+    ) -> QDoubleSpinBox:
+        control = QDoubleSpinBox()
+        control.setDecimals(4)
+        control.setRange(minimum, maximum)
+        control.setValue(value)
+        control.setSuffix(suffix)
+        return control
 
     def _build_cursor_panel(self) -> QWidget:
         panel = QGroupBox("Cursores")
@@ -360,6 +468,31 @@ class MainWindow(QMainWindow):
         )
         self.snap_x_to_samples.toggled.connect(self._snap_option_changed)
         layout.addWidget(self.snap_x_to_samples)
+
+        cycle_group = QGroupBox("Ciclo motor 0°–720°")
+        cycle_layout = QVBoxLayout(cycle_group)
+        self.define_cycle_button = QPushButton("Marcar 0° y 720°")
+        self.define_cycle_button.setToolTip(
+            "Seleccione primero el inicio 0° y después el final 720° sobre la señal"
+        )
+        self.define_cycle_button.clicked.connect(self._begin_cycle_reference)
+        self.clear_cycle_button = QPushButton("Quitar ciclo")
+        self.clear_cycle_button.setEnabled(False)
+        self.clear_cycle_button.clicked.connect(self._clear_cycle_reference)
+        cycle_buttons = QHBoxLayout()
+        cycle_buttons.addWidget(self.define_cycle_button)
+        cycle_buttons.addWidget(self.clear_cycle_button)
+        cycle_layout.addLayout(cycle_buttons)
+        self.cycle_start_phase = QComboBox()
+        self.cycle_start_phase.addItems([phase[0] for phase in ENGINE_PHASES])
+        self.cycle_start_phase.currentIndexChanged.connect(self._cycle_phase_changed)
+        cycle_layout.addWidget(QLabel("Etapa que comienza en 0°:"))
+        cycle_layout.addWidget(self.cycle_start_phase)
+        self.cycle_summary = QLabel("Sin referencia angular")
+        self.cycle_summary.setWordWrap(True)
+        cycle_layout.addWidget(self.cycle_summary)
+        layout.addWidget(cycle_group)
+
         self.cursor_metrics = QTableWidget(len(CURSOR_ROWS), 2)
         self.cursor_metrics.setHorizontalHeaderLabels(["Medida", "Resultado"])
         self.cursor_metrics.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -371,7 +504,7 @@ class MainWindow(QMainWindow):
             self.cursor_metrics.setItem(row, 1, QTableWidgetItem("—"))
             self.cursor_metrics.setRowHeight(row, 23)
         self.cursor_metrics.setMinimumHeight(275)
-        self.cursor_metrics.setMaximumHeight(300)
+        self.cursor_metrics.setMaximumHeight(370)
         layout.addWidget(self.cursor_metrics)
 
         values_label = QLabel("Valores por canal")
@@ -462,6 +595,10 @@ class MainWindow(QMainWindow):
         y_action.setChecked(self.show_y_cursors.isChecked())
         y_action.toggled.connect(self.show_y_cursors.setChecked)
         menu.addSeparator()
+        menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
+        if self._cycle_reference is not None:
+            menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
+        menu.addSeparator()
         cursor_table_action = menu.addAction("Tabla superpuesta de cursores")
         cursor_table_action.setCheckable(True)
         cursor_table_action.setChecked(self._show_cursor_overlay)
@@ -511,10 +648,21 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Error de importación")
             return
 
+        self.show_x_cursors.blockSignals(True)
+        self.show_y_cursors.blockSignals(True)
+        self.show_x_cursors.setChecked(False)
+        self.show_y_cursors.setChecked(False)
+        self.show_x_cursors.blockSignals(False)
+        self.show_y_cursors.blockSignals(False)
+        self._placing_cursor = None
         self._acquisition = result.acquisition
         self._channel_checks.clear()
         self._native_probe_factors.clear()
+        self._applied_probe_factors.clear()
         self._probe_controls.clear()
+        self.pressure_enabled.setChecked(False)
+        self._pressure_mode_active = False
+        self._clear_cycle_reference()
         self.channel_table.setRowCount(0)
         self._draw_acquisition(result.acquisition)
         self._populate_channel_panel(result.acquisition)
@@ -549,6 +697,12 @@ class MainWindow(QMainWindow):
         self.plot.addItem(self.cursor_y2, ignoreBounds=True)
         self.plot.addItem(self.cursor_overlay, ignoreBounds=True)
         self.plot.addItem(self.stats_overlay, ignoreBounds=True)
+        self.plot.addItem(self.cycle_overlay, ignoreBounds=True)
+        for phase_region, phase_label in zip(
+            self._phase_regions, self._phase_labels, strict=True
+        ):
+            self.plot.addItem(phase_region, ignoreBounds=True)
+            self.plot.addItem(phase_label, ignoreBounds=True)
         self._toggle_x_cursors(self.show_x_cursors.isChecked())
         self._toggle_y_cursors(self.show_y_cursors.isChecked())
         self.plot.setXRange(
@@ -560,6 +714,10 @@ class MainWindow(QMainWindow):
     def _populate_channel_panel(self, acquisition: Acquisition) -> None:
         self.channel_table.setRowCount(len(acquisition.channels))
         self._channel_checks.clear()
+        self.pressure_channel.blockSignals(True)
+        self.pressure_channel.clear()
+        self.pressure_channel.addItems([channel.name for channel in acquisition.channels])
+        self.pressure_channel.blockSignals(False)
         for row, channel in enumerate(acquisition.channels):
             checkbox = QCheckBox()
             checkbox.setChecked(True)
@@ -585,6 +743,7 @@ class MainWindow(QMainWindow):
             if not np.isfinite(native_probe) or native_probe <= 0:
                 native_probe = 1.0
             self._native_probe_factors.append(native_probe)
+            self._applied_probe_factors.append(native_probe)
             probe_control = QDoubleSpinBox()
             probe_control.setDecimals(2)
             probe_control.setRange(0.01, 1000.0)
@@ -615,10 +774,28 @@ class MainWindow(QMainWindow):
         acquisition = self._acquisition
         if acquisition is None or index >= len(acquisition.channels):
             return
-        samples = self._samples_with_probe(index, factor)
+        previous_factor = (
+            self._applied_probe_factors[index]
+            if index < len(self._applied_probe_factors)
+            else self._native_probe_factors[index]
+        )
+        ratio = factor / previous_factor if previous_factor > 0 else 1.0
+        if index < len(self._applied_probe_factors):
+            self._applied_probe_factors[index] = factor
+        samples = self._displayed_samples(index, factor)
         if index < len(self._plot_items):
             self._plot_items[index].setData(acquisition.time, samples)
         if index < len(self._channel_checks) and self._channel_checks[index].isChecked():
+            visible = self._visible_channel_indices()
+            if (
+                visible == [index]
+                and not self._pressure_enabled_for(index)
+                and not np.isclose(ratio, 1.0)
+            ):
+                self.cursor_y1.setValue(float(self.cursor_y1.value()) * ratio)
+                self.cursor_y2.setValue(float(self.cursor_y2.value()) * ratio)
+            elif visible == [index] and self._pressure_enabled_for(index):
+                self._reset_y_cursors(samples)
             self._auto_y()
         self.statusBar().showMessage(
             f"{acquisition.channels[index].name}: atenuación ajustada a {factor:g}X"
@@ -637,6 +814,84 @@ class MainWindow(QMainWindow):
         if np.isclose(ratio, 1.0):
             return original
         return np.asarray(original * np.float32(ratio), dtype=np.float32)
+
+    def _pressure_enabled_for(self, index: int) -> bool:
+        return self._pressure_mode_active and index == self.pressure_channel.currentIndex()
+
+    def _displayed_samples(self, index: int, factor: float | None = None) -> np.ndarray:
+        voltage = self._samples_with_probe(index, factor)
+        if not self._pressure_enabled_for(index):
+            return voltage
+        voltage_min = self.pressure_voltage_min.value()
+        voltage_span = self.pressure_voltage_max.value() - voltage_min
+        if np.isclose(voltage_span, 0.0):
+            return voltage
+        pressure_span = self.pressure_max.value() - self.pressure_min.value()
+        slope = pressure_span / voltage_span * self.pressure_gain.value()
+        return np.asarray(
+            self.pressure_min.value() + (voltage - voltage_min) * slope,
+            dtype=np.float32,
+        )
+
+    def _display_unit(self, index: int) -> str:
+        acquisition = self._acquisition
+        if acquisition is None:
+            return "V"
+        return "PSI" if self._pressure_enabled_for(index) else acquisition.channels[index].unit
+
+    def _apply_pressure_configuration(self, *_args: object) -> None:
+        acquisition = self._acquisition
+        requested = self.pressure_enabled.isChecked()
+        voltage_span = self.pressure_voltage_max.value() - self.pressure_voltage_min.value()
+        if requested and np.isclose(voltage_span, 0.0):
+            self.pressure_enabled.blockSignals(True)
+            self.pressure_enabled.setChecked(False)
+            self.pressure_enabled.blockSignals(False)
+            QMessageBox.warning(
+                self,
+                "Calibración inválida",
+                "El voltaje mínimo y máximo del sensor deben ser diferentes.",
+            )
+            requested = False
+        self._pressure_mode_active = requested
+        pressure_span = self.pressure_max.value() - self.pressure_min.value()
+        slope = pressure_span / voltage_span * self.pressure_gain.value() if voltage_span else 0.0
+        self.pressure_calibration.setText(
+            f"Ganancia efectiva: {slope:,.6g} PSI/V · sin recorte fuera del rango"
+        )
+        selected = self.pressure_channel.currentIndex()
+        if requested and 0 <= selected < len(self._channel_checks):
+            for index, checkbox in enumerate(self._channel_checks):
+                checkbox.setChecked(index == selected)
+        for index, item in enumerate(self._plot_items):
+            item.setData(acquisition.time, self._displayed_samples(index))
+            channel = acquisition.channels[index]
+            label = self._display_unit(index)
+            self.channel_table.item(index, 1).setText(f"{channel.name}  [{label}]")
+        vertical_axis = self.plot.plotItem.getAxis("left")
+        vertical_axis.enableAutoSIPrefix(not requested)
+        vertical_unit = "PSI" if requested else "V"
+        self.cursor_y1.label.setFormat(f"Y1  {{value:.6g}} {vertical_unit}")
+        self.cursor_y2.label.setFormat(f"Y2  {{value:.6g}} {vertical_unit}")
+        self.plot.setLabel(
+            "left",
+            "Presión" if requested else "Amplitud",
+            units="PSI" if requested else "V",
+        )
+        if 0 <= selected < len(self._plot_items):
+            self._reset_y_cursors(self._displayed_samples(selected))
+        self._auto_y()
+        self._refresh_measurements()
+
+    def _reset_y_cursors(self, samples: np.ndarray) -> None:
+        finite = samples[np.isfinite(samples)]
+        if finite.size == 0:
+            return
+        minimum = float(np.min(finite))
+        maximum = float(np.max(finite))
+        span = maximum - minimum or max(abs(maximum), 1.0)
+        self.cursor_y1.setValue(minimum + span * 0.25)
+        self.cursor_y2.setValue(minimum + span * 0.75)
 
     def _solo_channel(self, selected_index: int) -> None:
         for index, checkbox in enumerate(self._channel_checks):
@@ -733,6 +988,159 @@ class MainWindow(QMainWindow):
         if enabled and self._acquisition is not None:
             self._set_selection(float(self.cursor_x1.value()), float(self.cursor_x2.value()))
 
+    def _begin_cycle_reference(self) -> None:
+        if self._acquisition is None:
+            QMessageBox.information(
+                self, "Ciclo motor", "Abra una adquisición antes de definir el ciclo."
+            )
+            return
+        self._pending_cycle_start = None
+        self._placing_cursor = "cycle0"
+        self.statusBar().showMessage("Ciclo motor: haga clic en el punto de 0°")
+
+    def _clear_cycle_reference(self) -> None:
+        self._cycle_reference = None
+        self._pending_cycle_start = None
+        if self._placing_cursor in ("cycle0", "cycle720"):
+            self._placing_cursor = None
+        if hasattr(self, "_phase_regions"):
+            for phase_region, phase_label in zip(
+                self._phase_regions, self._phase_labels, strict=True
+            ):
+                phase_region.hide()
+                phase_label.hide()
+        if hasattr(self, "clear_cycle_button"):
+            self.clear_cycle_button.setEnabled(False)
+            self.cycle_summary.setText("Sin referencia angular")
+        if hasattr(self, "cycle_overlay"):
+            self.cycle_overlay.hide()
+        if self._acquisition is not None:
+            self._refresh_measurements()
+
+    def _set_cycle_reference(self, start: float, end: float) -> None:
+        if end <= start:
+            self._placing_cursor = "cycle720"
+            self.statusBar().showMessage("El punto 720° debe estar a la derecha de 0°")
+            return
+        self._cycle_reference = (start, end)
+        self._pending_cycle_start = None
+        self._placing_cursor = None
+        duration = end - start
+        rpm = 120.0 / duration
+        self.cycle_summary.setText(
+            f"Ciclo: {self._format_time(duration)} · {rpm:,.1f} RPM · 180° por etapa"
+        )
+        self.clear_cycle_button.setEnabled(True)
+        self._update_cycle_phases()
+        self._update_cycle_overlay()
+        for index, (phase_region, phase_label) in enumerate(
+            zip(self._phase_regions, self._phase_labels, strict=True)
+        ):
+            phase_start = start + duration * index / 4.0
+            phase_end = start + duration * (index + 1) / 4.0
+            phase_region.setRegion((phase_start, phase_end))
+            phase_region.show()
+            phase_label.show()
+        self._position_overlays()
+        self._refresh_measurements()
+        self.statusBar().showMessage("Ciclo 0°–720° definido")
+
+    def _cycle_phase_changed(self, *_args: object) -> None:
+        if self._cycle_reference is None:
+            return
+        self._update_cycle_phases()
+        self._update_cycle_overlay()
+        self._position_overlays()
+
+    def _ordered_engine_phases(self) -> tuple[tuple[str, tuple[int, int, int, int]], ...]:
+        start = self.cycle_start_phase.currentIndex()
+        return ENGINE_PHASES[start:] + ENGINE_PHASES[:start]
+
+    def _update_cycle_phases(self) -> None:
+        for (phase_name, color), phase_region, phase_label in zip(
+            self._ordered_engine_phases(),
+            self._phase_regions,
+            self._phase_labels,
+            strict=True,
+        ):
+            phase_region.setBrush(pg.mkBrush(*color))
+            for boundary in phase_region.lines:
+                boundary.setPen(pg.mkPen(color[0], color[1], color[2], 100))
+            phase_label.setText(phase_name, color=pg.mkColor(color[0], color[1], color[2]))
+            phase_label.fill = pg.mkBrush(16, 20, 25, 205)
+            phase_label.border = pg.mkPen(color[0], color[1], color[2], 150)
+            phase_label.update()
+
+    def _update_cycle_overlay(self) -> None:
+        if self._cycle_reference is None:
+            self.cycle_overlay.hide()
+            return
+        start, end = self._cycle_reference
+        duration = end - start
+        rpm = 120.0 / duration
+        first_phase = self._ordered_engine_phases()[0][0]
+        rows: list[tuple[str, str]] = [
+            ("0°", self._format_time(start)),
+            ("720°", self._format_time(end)),
+            ("Ciclo", self._format_time(duration)),
+            ("RPM", f"{rpm:,.1f}"),
+            ("Inicio", first_phase),
+        ]
+        rows.extend(self._pressure_cycle_measurements(start, end))
+        body = "".join(
+            f"<tr><td style='padding-right:10px'>{label}</td><td><b>{value}</b></td></tr>"
+            for label, value in rows
+        )
+        self.cycle_overlay.setHtml(
+            "<div style='color:#f2f4f8;font-size:10pt'><table cellpadding='2'>"
+            + body
+            + "</table></div>"
+        )
+        self.cycle_overlay.show()
+
+    def _pressure_cycle_measurements(self, start: float, end: float) -> list[tuple[str, str]]:
+        acquisition = self._acquisition
+        channel_index = self.pressure_channel.currentIndex()
+        if (
+            acquisition is None
+            or not self._pressure_enabled_for(channel_index)
+            or not 0 <= channel_index < len(acquisition.channels)
+        ):
+            return []
+        samples = self._displayed_samples(channel_index)
+        first, last = inclusive_region_indices(acquisition.time, start, end)
+        cycle_samples = samples[first:last]
+        finite_indices = np.flatnonzero(np.isfinite(cycle_samples))
+        if finite_indices.size == 0:
+            return []
+        finite_values = cycle_samples[finite_indices]
+        local_peak = int(finite_indices[int(np.argmax(finite_values))])
+        peak_index = first + local_peak
+        peak_degrees = self._time_to_degrees(float(acquisition.time[peak_index]))
+        rows = [
+            ("P mín ciclo", self._format_value(float(np.min(finite_values)), "PSI")),
+            ("P máx ciclo", self._format_value(float(np.max(finite_values)), "PSI")),
+            ("Pico en", f"{peak_degrees:,.3f}°" if peak_degrees is not None else "—"),
+        ]
+        phase_duration = (end - start) / 4.0
+        for index, (phase_name, _color) in enumerate(self._ordered_engine_phases()):
+            phase_start = start + phase_duration * index
+            phase_end = phase_start + phase_duration
+            phase_first, phase_last = inclusive_region_indices(
+                acquisition.time, phase_start, phase_end
+            )
+            phase_values = samples[phase_first:phase_last]
+            phase_values = phase_values[np.isfinite(phase_values)]
+            maximum = float(np.max(phase_values)) if phase_values.size else float("nan")
+            rows.append((f"Máx. {phase_name}", self._format_value(maximum, "PSI")))
+        return rows
+
+    def _time_to_degrees(self, time_value: float) -> float | None:
+        if self._cycle_reference is None:
+            return None
+        start, end = self._cycle_reference
+        return (time_value - start) * 720.0 / (end - start)
+
     def _toggle_x_cursors(self, visible: bool) -> None:
         if visible and self._acquisition is not None:
             self._placing_cursor = "x1"
@@ -773,6 +1181,15 @@ class MainWindow(QMainWindow):
         self._refresh_measurements()
 
     def _place_requested_cursor(self, x_value: float, y_value: float) -> None:
+        if self._placing_cursor == "cycle0":
+            self._pending_cycle_start = x_value
+            self._placing_cursor = "cycle720"
+            self.statusBar().showMessage("Ciclo motor: haga clic en el punto de 720°")
+            return
+        if self._placing_cursor == "cycle720":
+            if self._pending_cycle_start is not None:
+                self._set_cycle_reference(self._pending_cycle_start, x_value)
+            return
         if self._placing_cursor == "x1":
             self.cursor_x1.setValue(x_value)
             self.cursor_x1.show()
@@ -811,25 +1228,33 @@ class MainWindow(QMainWindow):
         index2 = nearest_index(acquisition.time, time2)
         delta_time = abs(time2 - time1)
         frequency = 1.0 / delta_time if delta_time > 0 else None
+        degrees1 = self._time_to_degrees(time1)
+        degrees2 = self._time_to_degrees(time2)
+        delta_degrees = abs(degrees2 - degrees1) if None not in (degrees1, degrees2) else None
         first, last = inclusive_region_indices(acquisition.time, time1, time2)
 
         x_visible = self.show_x_cursors.isChecked()
+        vertical_unit = "PSI" if self._pressure_mode_active else "V"
         cursor_results = (
             self._format_time(time1) if x_visible else "—",
             self._format_time(time2) if x_visible else "—",
             self._format_time(delta_time) if x_visible else "—",
             f"{frequency:,.6g} Hz" if frequency is not None and x_visible else "—",
+            f"{degrees1:,.3f}°" if degrees1 is not None and x_visible else "—",
+            f"{degrees2:,.3f}°" if degrees2 is not None and x_visible else "—",
+            f"{delta_degrees:,.3f}°" if delta_degrees is not None and x_visible else "—",
             f"{index1:,}" if x_visible else "—",
             f"{index2:,}" if x_visible else "—",
             f"{last - first:,}" if x_visible else "—",
-            self._format_value(float(self.cursor_y1.value()), "V")
+            self._format_value(float(self.cursor_y1.value()), vertical_unit)
             if self.show_y_cursors.isChecked()
             else "—",
-            self._format_value(float(self.cursor_y2.value()), "V")
+            self._format_value(float(self.cursor_y2.value()), vertical_unit)
             if self.show_y_cursors.isChecked()
             else "—",
             self._format_value(
-                abs(float(self.cursor_y2.value()) - float(self.cursor_y1.value())), "V"
+                abs(float(self.cursor_y2.value()) - float(self.cursor_y1.value())),
+                vertical_unit,
             )
             if self.show_y_cursors.isChecked()
             else "—",
@@ -843,10 +1268,11 @@ class MainWindow(QMainWindow):
         visible = self._visible_channel_indices()
         self.cursor_values.setRowCount(len(visible) if x_visible else 0)
         self.statistics.setRowCount(len(visible))
-        stats_overlay_rows: list[tuple[str, str, str, str, str, str]] = []
+        stats_overlay_rows: list[tuple[str, str, str, str, str, str, str, str]] = []
         for visible_row, channel_index in enumerate(visible):
             channel = acquisition.channels[channel_index]
-            displayed_samples = self._samples_with_probe(channel_index)
+            displayed_samples = self._displayed_samples(channel_index)
+            display_unit = self._display_unit(channel_index)
             value1 = float(displayed_samples[index1])
             value2 = float(displayed_samples[index2])
             color = CHANNEL_COLORS[channel_index % len(CHANNEL_COLORS)]
@@ -854,35 +1280,52 @@ class MainWindow(QMainWindow):
             if x_visible:
                 cursor_values = (
                     channel.name,
-                    self._format_value(value1, channel.unit),
-                    self._format_value(value2, channel.unit),
-                    self._format_value(value2 - value1, channel.unit),
+                    self._format_value(value1, display_unit),
+                    self._format_value(value2, display_unit),
+                    self._format_value(value2 - value1, display_unit),
                 )
                 self._fill_row(self.cursor_values, visible_row, cursor_values, color)
 
             statistics = calculate_statistics(displayed_samples[first:last])
+            pulse = calculate_pulse_measurements(
+                acquisition.time[first:last], displayed_samples[first:last]
+            )
+            frequency_text = (
+                f"{pulse.frequency:,.6g} Hz" if pulse.frequency is not None else "—"
+            )
+            duty_text = (
+                f"{pulse.duty_positive:,.3f} %"
+                if pulse.duty_positive is not None
+                else "—"
+            )
             statistic_values = (
                 channel.name,
-                self._format_value(statistics.minimum, channel.unit),
-                self._format_value(statistics.maximum, channel.unit),
-                self._format_value(statistics.peak_to_peak, channel.unit),
-                self._format_value(statistics.mean, channel.unit),
-                self._format_value(statistics.rms, channel.unit),
+                self._format_value(statistics.minimum, display_unit),
+                self._format_value(statistics.maximum, display_unit),
+                self._format_value(statistics.peak_to_peak, display_unit),
+                self._format_value(statistics.mean, display_unit),
+                self._format_value(statistics.rms, display_unit),
+                frequency_text,
+                duty_text,
                 f"{statistics.count_valid:,}/{statistics.count_total:,}",
             )
             self._fill_row(self.statistics, visible_row, statistic_values, color)
             stats_overlay_rows.append(
                 (
                     channel.name,
-                    self._format_value(statistics.minimum, channel.unit),
-                    self._format_value(statistics.maximum, channel.unit),
-                    self._format_value(statistics.peak_to_peak, channel.unit),
-                    self._format_value(statistics.mean, channel.unit),
-                    self._format_value(statistics.rms, channel.unit),
+                    self._format_value(statistics.minimum, display_unit),
+                    self._format_value(statistics.maximum, display_unit),
+                    self._format_value(statistics.peak_to_peak, display_unit),
+                    self._format_value(statistics.mean, display_unit),
+                    self._format_value(statistics.rms, display_unit),
+                    frequency_text,
+                    duty_text,
                 )
             )
         self._update_cursor_overlay(cursor_results)
         self._update_stats_overlay(stats_overlay_rows)
+        if self._cycle_reference is not None:
+            self._update_cycle_overlay()
         self._position_overlays()
 
     def _update_cursor_overlay(self, values: tuple[str, ...]) -> None:
@@ -892,9 +1335,13 @@ class MainWindow(QMainWindow):
         else:
             rows: list[tuple[str, str]] = []
             if self.show_x_cursors.isChecked():
-                rows.extend(zip(("X1", "X2", "Δt", "Frecuencia"), values[:4], strict=True))
+                rows.extend(zip(("X1", "X2", "Δt", "1/Δt"), values[:4], strict=True))
+                if self._cycle_reference is not None:
+                    rows.extend(
+                        zip(("X1°", "X2°", "Δ°"), values[4:7], strict=True)
+                    )
             if self.show_y_cursors.isChecked():
-                rows.extend(zip(("Y1", "Y2", "ΔY"), values[7:10], strict=True))
+                rows.extend(zip(("Y1", "Y2", "ΔY"), values[10:13], strict=True))
             body = "".join(
                 f"<tr><td style='padding-right:10px'>{label}</td><td><b>{value}</b></td></tr>"
                 for label, value in rows
@@ -905,10 +1352,13 @@ class MainWindow(QMainWindow):
         )
         self.cursor_overlay.setVisible(self._show_cursor_overlay and self._any_cursor_visible())
 
-    def _update_stats_overlay(self, rows: list[tuple[str, str, str, str, str, str]]) -> None:
+    def _update_stats_overlay(
+        self, rows: list[tuple[str, str, str, str, str, str, str, str]]
+    ) -> None:
         header = (
             "<tr><td><b>Canal</b></td><td><b>Mín</b></td><td><b>Máx</b></td>"
-            "<td><b>Pk-Pk</b></td><td><b>Media</b></td><td><b>RMS</b></td></tr>"
+            "<td><b>Pk-Pk</b></td><td><b>Media</b></td><td><b>RMS</b></td>"
+            "<td><b>Freq</b></td><td><b>Duty+</b></td></tr>"
         )
         body = "".join(
             "<tr>" + "".join(f"<td style='padding-right:8px'>{value}</td>" for value in row) + "</tr>"
@@ -931,9 +1381,16 @@ class MainWindow(QMainWindow):
         for name, item in (
             ("cursor", self.cursor_overlay),
             ("stats", self.stats_overlay),
+            ("cycle", self.cycle_overlay),
         ):
             x_fraction, y_fraction = self._overlay_positions[name]
             item.setPos(x_low + x_span * x_fraction, y_low + y_span * y_fraction)
+        if self._cycle_reference is not None:
+            start, end = self._cycle_reference
+            phase_span = (end - start) / 4.0
+            label_y = y_high - y_span * 0.035
+            for index, phase_label in enumerate(self._phase_labels):
+                phase_label.setPos(start + phase_span * (index + 0.5), label_y)
 
     def _remember_overlay_position(self, name: str, item: pg.TextItem) -> None:
         (x_low, x_high), (y_low, y_high) = self.view_box.viewRange()
