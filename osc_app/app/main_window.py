@@ -10,6 +10,7 @@ from PySide6.QtGui import QActionGroup, QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -31,7 +33,17 @@ from PySide6.QtWidgets import (
 )
 from scipy.signal import lfilter, lfilter_zi
 
+from osc_app.app.guided_tests_dialog import GuidedTestsDialog
+from osc_app.app.math_channel_dialog import MathChannelDialog
+from osc_app.app.reference_dialog import ReferenceSettingsDialog
+from osc_app.app.serial_dialog import SerialDecodeDialog
+from osc_app.app.spectrum_dialog import SpectrumDialog
+from osc_app.core.advanced_measurements import (
+    calculate_edge_measurements,
+    estimate_delay_and_phase,
+)
 from osc_app.core.csv_importer import CsvImportError, GenericCsvImporter
+from osc_app.core.math_channels import calculate_math_channel
 from osc_app.core.measurements import (
     calculate_pulse_measurements,
     calculate_statistics,
@@ -39,6 +51,7 @@ from osc_app.core.measurements import (
     nearest_index,
 )
 from osc_app.core.models import Acquisition
+from osc_app.core.references import reference_time_shift, transform_reference
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
 
 CHANNEL_COLORS = ("#ffd43b", "#4dabf7", "#ff6b6b", "#69db7c")
@@ -57,6 +70,14 @@ STATISTIC_COLUMNS = (
     "RMS",
     "Freq",
     "Duty+",
+    "Subida",
+    "Bajada",
+    "Pulso+",
+    "Pulso−",
+    "Flancos↑",
+    "Flancos↓",
+    "Overshoot",
+    "Undershoot",
     "N",
 )
 CURSOR_VALUE_COLUMNS = ("Canal", "En X1", "En X2", "Diferencia")
@@ -170,6 +191,11 @@ class MainWindow(QMainWindow):
         self._acquisition: Acquisition | None = None
         self._updating_selection = False
         self._plot_items: list[pg.PlotDataItem] = []
+        self._reference_item: pg.PlotDataItem | None = None
+        self._reference_acquisition: Acquisition | None = None
+        self._math_items: list[pg.PlotDataItem] = []
+        self._math_results: list[np.ndarray] = []
+        self._math_names: list[str] = []
         self._channel_checks: list[QCheckBox] = []
         self._native_probe_factors: list[float] = []
         self._applied_probe_factors: list[float] = []
@@ -182,6 +208,7 @@ class MainWindow(QMainWindow):
         self._pressure_mode_active = False
         self._cycle_reference: tuple[float, float] | None = None
         self._pending_cycle_start: float | None = None
+        self._locked_x_delta = 0.0
         self._overlay_positions = {
             "cursor": (0.988, 0.975),
             "stats": (0.012, 0.025),
@@ -288,6 +315,9 @@ class MainWindow(QMainWindow):
         self.use_region.setChecked(True)
         self.use_region.toggled.connect(self._refresh_measurements)
         statistics_layout.addWidget(self.use_region)
+        self.phase_summary = QLabel("Retardo/fase: seleccione al menos dos canales")
+        self.phase_summary.setWordWrap(True)
+        statistics_layout.addWidget(self.phase_summary)
         statistics_layout.addWidget(self.statistics)
 
         self.main_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -381,6 +411,7 @@ class MainWindow(QMainWindow):
 
         self._phase_regions: list[pg.LinearRegionItem] = []
         self._phase_labels: list[pg.TextItem] = []
+        self._partition_lines: list[pg.InfiniteLine] = []
         for phase_name, color in ENGINE_PHASES:
             phase_region = pg.LinearRegionItem(
                 values=(0, 1),
@@ -530,6 +561,43 @@ class MainWindow(QMainWindow):
         )
         self.snap_x_to_samples.toggled.connect(self._snap_option_changed)
         cursor_layout.addWidget(self.snap_x_to_samples)
+        self.lock_x_cursors = QCheckBox("Bloquear separación X1–X2")
+        self.lock_x_cursors.toggled.connect(self._lock_x_changed)
+        cursor_layout.addWidget(self.lock_x_cursors)
+
+        numeric_group = QGroupBox("Posición numérica")
+        numeric_layout = QFormLayout(numeric_group)
+        self.x1_numeric = self._cursor_numeric_control()
+        self.x2_numeric = self._cursor_numeric_control()
+        self.y1_numeric = self._cursor_numeric_control()
+        self.y2_numeric = self._cursor_numeric_control()
+        self.x1_numeric.editingFinished.connect(
+            lambda: self._set_numeric_cursor("x1", self.x1_numeric.value())
+        )
+        self.x2_numeric.editingFinished.connect(
+            lambda: self._set_numeric_cursor("x2", self.x2_numeric.value())
+        )
+        self.y1_numeric.editingFinished.connect(
+            lambda: self._set_numeric_cursor("y1", self.y1_numeric.value())
+        )
+        self.y2_numeric.editingFinished.connect(
+            lambda: self._set_numeric_cursor("y2", self.y2_numeric.value())
+        )
+        numeric_layout.addRow("X1 (s):", self.x1_numeric)
+        numeric_layout.addRow("X2 (s):", self.x2_numeric)
+        numeric_layout.addRow("Y1:", self.y1_numeric)
+        numeric_layout.addRow("Y2:", self.y2_numeric)
+        cursor_layout.addWidget(numeric_group)
+
+        partition_row = QHBoxLayout()
+        partition_row.addWidget(QLabel("Particiones X1–X2:"))
+        self.partition_count = QSpinBox()
+        self.partition_count.setRange(0, 32)
+        self.partition_count.setSpecialValueText("Ninguna")
+        self.partition_count.setValue(0)
+        self.partition_count.valueChanged.connect(self._update_partition_lines)
+        partition_row.addWidget(self.partition_count)
+        cursor_layout.addLayout(partition_row)
 
         self.define_cycle_button = QPushButton("Marcar 0° y 720°")
         self.define_cycle_button.setToolTip(
@@ -581,6 +649,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(tabs)
         return panel
 
+    @staticmethod
+    def _cursor_numeric_control() -> QDoubleSpinBox:
+        control = QDoubleSpinBox()
+        control.setDecimals(9)
+        control.setRange(-1e12, 1e12)
+        control.setKeyboardTracking(False)
+        return control
+
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&Archivo")
         open_action = file_menu.addAction("&Abrir adquisición…")
@@ -616,8 +692,25 @@ class MainWindow(QMainWindow):
         tools_menu = self.menuBar().addMenu("&Herramientas")
         self.coupling_menu = tools_menu.addMenu("Acoplamiento DC/AC por canal")
         self.coupling_menu.aboutToShow.connect(self._rebuild_coupling_menu)
+        tools_menu.addSeparator()
+        tools_menu.addAction("Abrir señal de referencia…", self._choose_reference)
+        self.remove_reference_action = tools_menu.addAction(
+            "Quitar señal de referencia", self._remove_reference
+        )
+        self.remove_reference_action.setEnabled(False)
+        tools_menu.addSeparator()
+        tools_menu.addAction("Crear canal matemático…", self._create_math_channel)
+        self.remove_math_action = tools_menu.addAction(
+            "Quitar canales matemáticos", self._remove_math_channels
+        )
+        self.remove_math_action.setEnabled(False)
+        tools_menu.addSeparator()
+        tools_menu.addAction("Analizador FFT…", self._show_spectrum)
+        tools_menu.addAction("Decodificación UART…", self._show_serial_decoder)
 
         analysis_menu = self.menuBar().addMenu("&Análisis")
+        analysis_menu.addAction("Pruebas automotrices guiadas…", self._show_guided_tests)
+        analysis_menu.addSeparator()
         analysis_menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
         analysis_menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
         analysis_menu.addSeparator()
@@ -682,6 +775,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "channel_panel_action"):
             self.channel_panel_action.setChecked(visible)
 
+    def _show_guided_tests(self) -> None:
+        GuidedTestsDialog(self).exec()
+
     def _set_cursor_panel_visible(self, visible: bool) -> None:
         self.cursor_panel.setVisible(visible)
         self.right_panel_button.setChecked(visible)
@@ -735,6 +831,172 @@ class MainWindow(QMainWindow):
         )
         if selected:
             self.open_file(Path(selected))
+
+    def _choose_reference(self) -> None:
+        if self._acquisition is None:
+            QMessageBox.information(
+                self, "Señal de referencia", "Abra primero la adquisición principal."
+            )
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Abrir señal de referencia",
+            str(Path.cwd()),
+            "Adquisiciones (*.csv *.bin);;CSV (*.csv);;SIGLENT BIN (*.bin)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            if path.suffix.lower() == ".bin":
+                acquisition = self._bin_importer.load(path).acquisition
+            else:
+                acquisition = self._importer.load(path).acquisition
+        except (BinImportError, CsvImportError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Referencia no válida", str(exc))
+            return
+        dialog = ReferenceSettingsDialog(
+            [channel.name for channel in acquisition.channels], self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        index = dialog.channel.currentIndex()
+        channel = acquisition.channels[index]
+        mode = str(dialog.alignment.currentData())
+        region = tuple(float(value) for value in self.region.getRegion())
+        shift = reference_time_shift(
+            acquisition.time,
+            channel.samples,
+            mode,
+            active_x1=float(self.cursor_x1.value()),
+            region=region if mode == "peak" else None,
+        )
+        samples = transform_reference(
+            channel.samples, gain=dialog.gain.value(), offset=dialog.offset.value()
+        )
+        color = QColor("#d0d7de")
+        color.setAlphaF(dialog.alpha.value())
+        self._remove_reference()
+        self._reference_acquisition = acquisition
+        self._reference_item = self.plot.plot(
+            acquisition.time + shift,
+            samples,
+            pen=pg.mkPen(color, width=2, style=Qt.PenStyle.DashLine),
+            name=f"REF {channel.name} — {path.name}",
+        )
+        self.remove_reference_action.setEnabled(True)
+        self.statusBar().showMessage(f"Referencia cargada: {path.name} / {channel.name}")
+
+    def _remove_reference(self) -> None:
+        if self._reference_item is not None:
+            self.plot.removeItem(self._reference_item)
+        self._reference_item = None
+        self._reference_acquisition = None
+        if hasattr(self, "remove_reference_action"):
+            self.remove_reference_action.setEnabled(False)
+
+    def _create_math_channel(self) -> None:
+        acquisition = self._acquisition
+        if acquisition is None:
+            QMessageBox.information(
+                self, "Canal matemático", "Abra primero una adquisición."
+            )
+            return
+        dialog = MathChannelDialog(
+            [channel.name for channel in acquisition.channels], self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        first_index = dialog.first.currentIndex()
+        second_index = dialog.second.currentIndex()
+        operation = str(dialog.operation.currentData())
+        try:
+            samples = calculate_math_channel(
+                acquisition.time,
+                self._displayed_samples(first_index),
+                operation,
+                self._displayed_samples(second_index),
+                sample_rate=acquisition.sample_rate,
+                cutoff_hz=dialog.cutoff.value(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Canal matemático no válido", str(exc))
+            return
+        color = CHANNEL_COLORS[
+            (len(self._plot_items) + len(self._math_items)) % len(CHANNEL_COLORS)
+        ]
+        name = dialog.name.text().strip() or f"M{len(self._math_items) + 1}"
+        unit = dialog.unit.text().strip() or "—"
+        item = self.plot.plot(
+            acquisition.time,
+            samples,
+            pen=pg.mkPen(color, width=1.5),
+            name=f"{name} [{unit}]",
+        )
+        item.setDownsampling(auto=True, method=str(self.display_mode.currentData()))
+        self._math_items.append(item)
+        self._math_results.append(samples)
+        self._math_names.append(name)
+        self.remove_math_action.setEnabled(True)
+        self._auto_y()
+        self.statusBar().showMessage(f"Canal matemático creado: {name}")
+
+    def _remove_math_channels(self) -> None:
+        for item in self._math_items:
+            self.plot.removeItem(item)
+        self._math_items.clear()
+        self._math_results.clear()
+        self._math_names.clear()
+        if hasattr(self, "remove_math_action"):
+            self.remove_math_action.setEnabled(False)
+
+    def _analysis_slice(self) -> slice:
+        acquisition = self._acquisition
+        if (
+            acquisition is None
+            or not self.use_region.isChecked()
+            or not self.show_x_cursors.isChecked()
+        ):
+            return slice(None)
+        first, last = inclusive_region_indices(
+            acquisition.time,
+            float(self.cursor_x1.value()),
+            float(self.cursor_x2.value()),
+        )
+        return slice(first, last)
+
+    def _show_spectrum(self) -> None:
+        acquisition = self._acquisition
+        if acquisition is None or not acquisition.sample_rate:
+            QMessageBox.information(
+                self, "FFT", "Abra una adquisición con tasa de muestreo válida."
+            )
+            return
+        scope = self._analysis_slice()
+        names = [channel.name for channel in acquisition.channels] + self._math_names
+        channels = [
+            self._displayed_samples(index)[scope]
+            for index in range(len(acquisition.channels))
+        ] + [samples[scope] for samples in self._math_results]
+        SpectrumDialog(names, channels, acquisition.sample_rate, self).exec()
+
+    def _show_serial_decoder(self) -> None:
+        acquisition = self._acquisition
+        if acquisition is None:
+            QMessageBox.information(
+                self, "Decodificación UART", "Abra primero una adquisición."
+            )
+            return
+        scope = self._analysis_slice()
+        SerialDecodeDialog(
+            acquisition.time[scope],
+            [channel.name for channel in acquisition.channels],
+            [
+                self._displayed_samples(index)[scope]
+                for index in range(len(acquisition.channels))
+            ],
+            self,
+        ).exec()
 
     def save_plot_image(self) -> None:
         if self._acquisition is None:
@@ -831,6 +1093,8 @@ class MainWindow(QMainWindow):
 
         self.show_x_cursors.blockSignals(True)
         self.show_y_cursors.blockSignals(True)
+        self._remove_reference()
+        self._remove_math_channels()
         self.show_x_cursors.setChecked(False)
         self.show_y_cursors.setChecked(False)
         self.show_x_cursors.blockSignals(False)
@@ -1225,6 +1489,11 @@ class MainWindow(QMainWindow):
         if self._updating_selection or self._acquisition is None:
             return
         self._updating_selection = True
+        if hasattr(self, "lock_x_cursors") and self.lock_x_cursors.isChecked():
+            if self.sender() is self.cursor_x1:
+                self.cursor_x2.setValue(float(self.cursor_x1.value()) + self._locked_x_delta)
+            elif self.sender() is self.cursor_x2:
+                self.cursor_x1.setValue(float(self.cursor_x2.value()) - self._locked_x_delta)
         self.region.setRegion(
             sorted((float(self.cursor_x1.value()), float(self.cursor_x2.value())))
         )
@@ -1261,6 +1530,64 @@ class MainWindow(QMainWindow):
     def _snap_option_changed(self, enabled: bool) -> None:
         if enabled and self._acquisition is not None:
             self._set_selection(float(self.cursor_x1.value()), float(self.cursor_x2.value()))
+
+    def _lock_x_changed(self, enabled: bool) -> None:
+        if enabled:
+            self._locked_x_delta = float(self.cursor_x2.value()) - float(
+                self.cursor_x1.value()
+            )
+
+    def _set_numeric_cursor(self, name: str, value: float) -> None:
+        cursor = {
+            "x1": self.cursor_x1,
+            "x2": self.cursor_x2,
+            "y1": self.cursor_y1,
+            "y2": self.cursor_y2,
+        }[name]
+        cursor.setValue(value)
+        cursor.show()
+        if name.startswith("x"):
+            self._x_cursor_dragged()
+            self._x_cursor_finished()
+        else:
+            self._refresh_measurements()
+
+    def _sync_numeric_cursors(self) -> None:
+        if not hasattr(self, "x1_numeric"):
+            return
+        for control, value in (
+            (self.x1_numeric, float(self.cursor_x1.value())),
+            (self.x2_numeric, float(self.cursor_x2.value())),
+            (self.y1_numeric, float(self.cursor_y1.value())),
+            (self.y2_numeric, float(self.cursor_y2.value())),
+        ):
+            control.blockSignals(True)
+            control.setValue(value)
+            control.blockSignals(False)
+
+    def _update_partition_lines(self, *_args: object) -> None:
+        for line in self._partition_lines:
+            self.plot.removeItem(line)
+        self._partition_lines.clear()
+        count = self.partition_count.value() if hasattr(self, "partition_count") else 0
+        if count < 2 or self._acquisition is None:
+            return
+        start, end = sorted(
+            (float(self.cursor_x1.value()), float(self.cursor_x2.value()))
+        )
+        if end <= start:
+            return
+        for index in range(1, count):
+            position = start + (end - start) * index / count
+            line = pg.InfiniteLine(
+                position,
+                angle=90,
+                movable=False,
+                pen=pg.mkPen(180, 190, 205, 115, width=1, style=Qt.PenStyle.DotLine),
+            )
+            line.setZValue(20)
+            self.plot.addItem(line, ignoreBounds=True)
+            self._partition_lines.append(line)
 
     def _begin_cycle_reference(self) -> None:
         if self._acquisition is None:
@@ -1569,6 +1896,9 @@ class MainWindow(QMainWindow):
             pulse = calculate_pulse_measurements(
                 acquisition.time[first:last], displayed_samples[first:last]
             )
+            edges = calculate_edge_measurements(
+                acquisition.time[first:last], displayed_samples[first:last]
+            )
             frequency_text = (
                 f"{pulse.frequency:,.6g} Hz" if pulse.frequency is not None else "—"
             )
@@ -1586,6 +1916,18 @@ class MainWindow(QMainWindow):
                 self._format_value(statistics.rms, display_unit),
                 frequency_text,
                 duty_text,
+                self._format_time(edges.rise_time) if edges.rise_time is not None else "—",
+                self._format_time(edges.fall_time) if edges.fall_time is not None else "—",
+                self._format_time(edges.high_width) if edges.high_width is not None else "—",
+                self._format_time(edges.low_width) if edges.low_width is not None else "—",
+                f"{edges.rising_edges:,}",
+                f"{edges.falling_edges:,}",
+                self._format_value(edges.overshoot, display_unit)
+                if edges.overshoot is not None
+                else "—",
+                self._format_value(edges.undershoot, display_unit)
+                if edges.undershoot is not None
+                else "—",
                 f"{statistics.count_valid:,}/{statistics.count_total:,}",
             )
             self._fill_row(self.statistics, visible_row, statistic_values, color)
@@ -1601,11 +1943,30 @@ class MainWindow(QMainWindow):
                     duty_text,
                 )
             )
+        if len(visible) >= 2:
+            first_channel = self._displayed_samples(visible[0])[first:last]
+            second_channel = self._displayed_samples(visible[1])[first:last]
+            scoped_time = acquisition.time[first:last]
+            reference_pulse = calculate_pulse_measurements(scoped_time, first_channel)
+            delay, phase = estimate_delay_and_phase(
+                scoped_time, first_channel, second_channel, reference_pulse.frequency
+            )
+            delay_text = self._format_time(delay) if delay is not None else "—"
+            phase_text = f"{phase:,.3f}°" if phase is not None else "—"
+            self.phase_summary.setText(
+                f"{acquisition.channels[visible[1]].name} respecto a "
+                f"{acquisition.channels[visible[0]].name}: "
+                f"retardo {delay_text} · fase {phase_text}"
+            )
+        else:
+            self.phase_summary.setText("Retardo/fase: seleccione al menos dos canales")
         self._update_cursor_overlay(cursor_results)
         self._update_stats_overlay(stats_overlay_rows)
         if self._cycle_reference is not None:
             self._update_cycle_overlay()
         self._position_overlays()
+        self._sync_numeric_cursors()
+        self._update_partition_lines()
 
     def _update_cursor_overlay(self, values: tuple[str, ...]) -> None:
         placement_prompts = {

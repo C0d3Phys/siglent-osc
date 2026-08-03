@@ -35,6 +35,13 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 - Frecuencia automática y Duty+ mediante umbral medio e histéresis 40/60 %.
 - Tablas superpuestas movibles para cursores, estadísticas y ciclo motor.
 - Exportación PNG con las mediciones y superposiciones visibles.
+- Señales de referencia CSV/BIN con alineación, ganancia, offset y transparencia.
+- Reglas X bloqueables, entrada numérica y hasta 32 particiones configurables.
+- Mediciones de flancos, pulsos, subida, bajada, overshoot, retardo y fase.
+- Seis pruebas automotrices guiadas con conexiones, preparación y seguridad.
+- Canales matemáticos seguros: operaciones A/B, derivada, integral y filtros.
+- Analizador FFT con ventanas, escala lineal/dB y conversión de pico a RPM.
+- Decodificación UART 8-N-1 inicial con tabla hexadecimal y validación de parada.
 
 ## Análisis de ciclo motor
 
@@ -136,6 +143,11 @@ Usa **Archivo → Abrir adquisición** para seleccionar un archivo `.csv` o `.bi
 | Corregir voltaje real | Ajustar `Sonda` en el panel de canales |
 | Abrir menú de gráfica | Clic derecho sobre la gráfica |
 | Guardar imagen | `Ctrl + S` |
+| Abrir señal de referencia | `Herramientas → Abrir señal de referencia` |
+| Crear canal matemático | `Herramientas → Crear canal matemático` |
+| Analizar espectro | `Herramientas → Analizador FFT` |
+| Decodificar UART | `Herramientas → Decodificación UART` |
+| Abrir pruebas guiadas | `Análisis → Pruebas automotrices guiadas` |
 | Abrir adquisición | `Ctrl + O` |
 
 ## CSV sintético para pruebas

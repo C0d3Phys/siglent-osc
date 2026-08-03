@@ -9,6 +9,7 @@ Este directorio reúne la visión del producto y los documentos ejecutables de d
 | [product-specification.md](product-specification.md) | Visión completa, arquitectura y funciones futuras |
 | [mvp-specification.md](mvp-specification.md) | Alcance verificable de la primera entrega |
 | [development-plan.md](development-plan.md) | Etapas, riesgos y condiciones de salida |
+| [analysis-tools-roadmap.md](analysis-tools-roadmap.md) | Diseño y aceptación de referencias, reglas, mediciones, guías, matemáticas, FFT y serial |
 
 ## Precedencia
 
@@ -20,4 +21,3 @@ Cuando exista una diferencia entre documentos:
 4. `product-specification.md` representa la visión de largo plazo.
 
 La especificación general no implica que todas sus funciones estén implementadas.
-
