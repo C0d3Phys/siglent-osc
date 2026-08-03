@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_exporters
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QActionGroup, QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -35,6 +36,7 @@ from scipy.signal import lfilter, lfilter_zi
 
 from osc_app.app.guided_tests_dialog import GuidedTestsDialog
 from osc_app.app.math_channel_dialog import MathChannelDialog
+from osc_app.app.reference_comparison_dialog import ReferenceComparisonDialog
 from osc_app.app.reference_dialog import ReferenceSettingsDialog
 from osc_app.app.serial_dialog import SerialDecodeDialog
 from osc_app.app.spectrum_dialog import SpectrumDialog
@@ -51,7 +53,7 @@ from osc_app.core.measurements import (
     nearest_index,
 )
 from osc_app.core.models import Acquisition
-from osc_app.core.references import reference_time_shift, transform_reference
+from osc_app.core.references import compare_reference, reference_time_shift, transform_reference
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
 
 CHANNEL_COLORS = ("#ffd43b", "#4dabf7", "#ff6b6b", "#69db7c")
@@ -126,6 +128,12 @@ def next_125(value: float, zoom_in: bool) -> float:
 class OscilloscopeViewBox(pg.ViewBox):
     """Rueda horizontal tipo Time/div; Ctrl+rueda controla V/div."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.reference_drag_callback = None
+        self.reference_is_selected = None
+        self.zoom_extended_callback = None
+
     def wheelEvent(self, event, axis=None) -> None:
         delta = event.delta()
         if delta == 0:
@@ -145,6 +153,83 @@ class OscilloscopeViewBox(pg.ViewBox):
             self.disableAutoRange(axis="x")
             self.scaleBy(x=factor, center=QPointF(center.x(), center.y()))
         event.accept()
+
+    def mouseDragEvent(self, event, axis=None) -> None:
+        reference_selected = (
+            self.reference_is_selected is not None and self.reference_is_selected()
+        )
+        if (
+            reference_selected
+            and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and self.reference_drag_callback is not None
+        ):
+            current = self.mapToView(event.pos())
+            previous = self.mapToView(event.lastPos())
+            self.reference_drag_callback(current - previous, event.isFinish())
+            event.accept()
+            return
+        super().mouseDragEvent(event, axis=axis)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if (
+            event.button() == Qt.MouseButton.MiddleButton
+            and self.zoom_extended_callback is not None
+        ):
+            self.zoom_extended_callback()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class ChannelOffsetTag(QLabel):
+    """External 0 V marker constrained to vertical movement."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        channel_label: str,
+        color: str,
+        moved_callback,
+        reset_callback,
+    ) -> None:
+        super().__init__(f"{channel_label} ▶", parent)
+        self._moved_callback = moved_callback
+        self._reset_callback = reset_callback
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedSize(38, 22)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setStyleSheet(
+            f"QLabel {{ background-color: {color}; color: #101419; "
+            "font-weight: bold; border-radius: 3px; padding: 1px; }"
+        )
+        self.setToolTip(
+            f"{channel_label}: nivel de 0 V. Arrastre solo verticalmente; "
+            "doble clic para volver a cero"
+        )
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            parent_position = self.parentWidget().mapFromGlobal(
+                event.globalPosition().toPoint()
+            )
+            self._moved_callback(float(parent_position.y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._reset_callback()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class DraggableTextItem(pg.TextItem):
@@ -180,6 +265,28 @@ class DraggableTextItem(pg.TextItem):
             self.setCursor(Qt.CursorShape.OpenHandCursor)
 
 
+class CtrlDraggableReferenceItem(pg.PlotDataItem):
+    """Reference waveform with a lightweight selected visual state."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._selected = False
+        self._base_pen = pg.mkPen(self.opts["pen"])
+        selected_color = QColor(self._base_pen.color())
+        selected_color.setAlpha(255)
+        self._selected_pen = pg.mkPen(
+            selected_color, width=max(float(self._base_pen.widthF()) + 2.5, 4.0)
+        )
+        self.setToolTip("Mantenga Ctrl y arrastre para sincronizar la referencia")
+
+    def set_reference_selected(self, selected: bool) -> None:
+        self._selected = selected
+        if selected:
+            self.setPen(self._selected_pen)
+        else:
+            self.setPen(self._base_pen)
+
+
 class MainWindow(QMainWindow):
     """Visor CSV con paneles fijos para canales, cursores y mediciones."""
 
@@ -191,8 +298,11 @@ class MainWindow(QMainWindow):
         self._acquisition: Acquisition | None = None
         self._updating_selection = False
         self._plot_items: list[pg.PlotDataItem] = []
-        self._reference_item: pg.PlotDataItem | None = None
+        self._reference_item: CtrlDraggableReferenceItem | None = None
         self._reference_acquisition: Acquisition | None = None
+        self._reference_selected = False
+        self._reference_error_item: pg.PlotDataItem | None = None
+        self._last_reference_comparison = None
         self._math_items: list[pg.PlotDataItem] = []
         self._math_results: list[np.ndarray] = []
         self._math_names: list[str] = []
@@ -200,7 +310,11 @@ class MainWindow(QMainWindow):
         self._native_probe_factors: list[float] = []
         self._applied_probe_factors: list[float] = []
         self._probe_controls: list[QDoubleSpinBox] = []
+        self._channel_display_offsets: list[float] = []
+        self._offset_controls: list[QDoubleSpinBox] = []
+        self._channel_offset_tags: list[ChannelOffsetTag] = []
         self._coupling_modes: list[str] = []
+        self._channel_inverted: list[bool] = []
         self._coupling_cache: dict[tuple[int, str, float], np.ndarray] = {}
         self._placing_cursor: str | None = None
         self._show_cursor_overlay = False
@@ -341,6 +455,9 @@ class MainWindow(QMainWindow):
 
     def _build_plot(self) -> None:
         self.view_box = OscilloscopeViewBox()
+        self.view_box.reference_is_selected = lambda: self._reference_selected
+        self.view_box.reference_drag_callback = self._drag_selected_reference
+        self.view_box.zoom_extended_callback = self._show_full_view
         plot_item = pg.PlotItem(viewBox=self.view_box)
         self.plot_item = plot_item
         self.graph_navigation_menu = self.view_box.menu
@@ -349,10 +466,14 @@ class MainWindow(QMainWindow):
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "Tiempo", units="s")
         self.plot.setLabel("left", "Amplitud", units="V")
+        # Reserve a real gutter for the channel 0 V markers. They must never sit
+        # over the graticule or compete with the numeric tick labels.
+        plot_item.getAxis("left").setWidth(82)
         self.plot.setDownsampling(auto=True, mode="peak")
         self.plot.setClipToView(True)
         self.view_box.sigXRangeChanged.connect(self._update_time_div_label)
         self.view_box.sigRangeChanged.connect(self._position_overlays)
+        self.view_box.sigRangeChanged.connect(self._position_channel_offset_tags)
         self.plot.scene().sigMouseClicked.connect(self._plot_mouse_clicked)
 
         self.cursor_x1 = pg.InfiniteLine(
@@ -465,14 +586,21 @@ class MainWindow(QMainWindow):
     def _build_channel_panel(self) -> QWidget:
         panel = QGroupBox("Canales")
         layout = QVBoxLayout(panel)
-        self.channel_table = QTableWidget(0, 4)
-        self.channel_table.setHorizontalHeaderLabels(["Ver", "Canal", "Sonda", "Solo"])
+        self.channel_table = QTableWidget(0, 5)
+        self.channel_table.setHorizontalHeaderLabels(
+            ["Ver", "Canal", "Sonda", "Offset visual", "Solo"]
+        )
         self.channel_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.channel_table.verticalHeader().setVisible(False)
         self.channel_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.channel_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.channel_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.channel_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.channel_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.channel_table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
         layout.addWidget(self.channel_table, 1)
 
         show_all = QPushButton("Mostrar todos")
@@ -673,6 +801,9 @@ class MainWindow(QMainWindow):
         channels_menu.addAction("Mostrar todos", self._show_all_channels)
         channels_menu.addAction("Ocultar todos", self._hide_all_channels)
         channels_menu.addSeparator()
+        channels_menu.addAction("Separar canales automáticamente", self._auto_arrange_channels)
+        channels_menu.addAction("Restablecer offsets visuales", self._reset_channel_offsets)
+        channels_menu.addSeparator()
         channels_menu.addAction(
             "Configurar compresímetro…", lambda: self.pressure_group.setChecked(True)
         )
@@ -698,6 +829,10 @@ class MainWindow(QMainWindow):
             "Quitar señal de referencia", self._remove_reference
         )
         self.remove_reference_action.setEnabled(False)
+        self.compare_reference_action = tools_menu.addAction(
+            "Comparar con referencia…", self._compare_with_reference
+        )
+        self.compare_reference_action.setEnabled(False)
         tools_menu.addSeparator()
         tools_menu.addAction("Crear canal matemático…", self._create_math_channel)
         self.remove_math_action = tools_menu.addAction(
@@ -774,6 +909,7 @@ class MainWindow(QMainWindow):
         self.left_panel_button.setChecked(visible)
         if hasattr(self, "channel_panel_action"):
             self.channel_panel_action.setChecked(visible)
+        self._update_upper_splitter_sizes()
 
     def _show_guided_tests(self) -> None:
         GuidedTestsDialog(self).exec()
@@ -783,6 +919,16 @@ class MainWindow(QMainWindow):
         self.right_panel_button.setChecked(visible)
         if hasattr(self, "cursor_panel_action"):
             self.cursor_panel_action.setChecked(visible)
+        self._update_upper_splitter_sizes()
+        if visible and self._acquisition is not None:
+            self._refresh_measurements()
+
+    def _update_upper_splitter_sizes(self) -> None:
+        total = max(self.upper_splitter.width(), 900)
+        channel_width = 300 if self.channel_panel.isVisible() else 0
+        cursor_width = 340 if self.cursor_panel.isVisible() else 0
+        graph_width = max(total - channel_width - cursor_width, 320)
+        self.upper_splitter.setSizes([channel_width, graph_width, cursor_width])
 
     def _set_statistics_panel_visible(self, visible: bool) -> None:
         self.statistics_panel.setVisible(visible)
@@ -792,6 +938,8 @@ class MainWindow(QMainWindow):
         if visible:
             upper_height = max(self.main_splitter.height() - 190, 320)
             self.main_splitter.setSizes([upper_height, 190])
+            if self._acquisition is not None:
+                self._refresh_measurements()
 
     def _rebuild_coupling_menu(self) -> None:
         self.coupling_menu.clear()
@@ -819,6 +967,16 @@ class MainWindow(QMainWindow):
                         else None
                     )
                 )
+            channel_menu.addSeparator()
+            invert_action = channel_menu.addAction("Invertir polaridad")
+            invert_action.setCheckable(True)
+            invert_action.setChecked(self._channel_inverted[index])
+            invert_action.setEnabled(not pressure_locked)
+            invert_action.toggled.connect(
+                lambda checked, channel_index=index: self._set_channel_inverted(
+                    channel_index, checked
+                )
+            )
             if pressure_locked:
                 channel_menu.setToolTip("El compresímetro requiere acoplamiento DC")
 
@@ -878,22 +1036,143 @@ class MainWindow(QMainWindow):
         color.setAlphaF(dialog.alpha.value())
         self._remove_reference()
         self._reference_acquisition = acquisition
-        self._reference_item = self.plot.plot(
+        self._reference_item = CtrlDraggableReferenceItem(
             acquisition.time + shift,
             samples,
             pen=pg.mkPen(color, width=2, style=Qt.PenStyle.DashLine),
             name=f"REF {channel.name} — {path.name}",
         )
+        self.plot.addItem(self._reference_item)
         self.remove_reference_action.setEnabled(True)
-        self.statusBar().showMessage(f"Referencia cargada: {path.name} / {channel.name}")
+        self.compare_reference_action.setEnabled(True)
+        self.statusBar().showMessage(
+            f"Referencia cargada: {path.name} / {channel.name} · "
+            "Ctrl + arrastrar para sincronizar"
+        )
+
+    def _toggle_reference_selection(self, item: CtrlDraggableReferenceItem) -> None:
+        self._reference_selected = not self._reference_selected
+        item.set_reference_selected(self._reference_selected)
+        if self._reference_selected:
+            self.statusBar().showMessage(
+                "Referencia seleccionada · Ctrl + arrastrar sobre la gráfica para sincronizar"
+            )
+        else:
+            self.statusBar().showMessage("Referencia protegida")
+
+    def _try_toggle_reference_at(self, scene_position: QPointF) -> bool:
+        item = self._reference_item
+        if item is None or item.xData is None or item.yData is None or item.xData.size == 0:
+            return False
+        clicked = self.view_box.mapSceneToView(scene_position)
+        local_x = float(clicked.x() - item.pos().x())
+        index = int(np.searchsorted(item.xData, local_x))
+        candidates = [candidate for candidate in (index - 1, index) if 0 <= candidate < item.xData.size]
+        if not candidates:
+            return False
+        nearest = min(
+            candidates,
+            key=lambda candidate: abs(float(item.xData[candidate]) - local_x),
+        )
+        reference_scene = self.view_box.mapViewToScene(
+            QPointF(
+                float(item.xData[nearest] + item.pos().x()),
+                float(item.yData[nearest] + item.pos().y()),
+            )
+        )
+        distance = reference_scene - scene_position
+        if distance.x() ** 2 + distance.y() ** 2 > 18.0**2:
+            return False
+        self._toggle_reference_selection(item)
+        return True
+
+    def _drag_selected_reference(self, delta: QPointF, finished: bool = False) -> None:
+        item = self._reference_item
+        if item is None or not self._reference_selected:
+            return
+        current = item.pos()
+        item.setPos(current.x() + delta.x(), current.y() + delta.y())
+        self._remove_reference_error()
+        position = item.pos()
+        state = "Sincronización guardada" if finished else "Moviendo referencia"
+        self.statusBar().showMessage(
+            f"{state}: Δt {self._format_time(float(position.x()))} · "
+            f"ΔY {float(position.y()):,.6g}"
+        )
 
     def _remove_reference(self) -> None:
+        self._reference_selected = False
+        self._remove_reference_error()
         if self._reference_item is not None:
             self.plot.removeItem(self._reference_item)
         self._reference_item = None
         self._reference_acquisition = None
         if hasattr(self, "remove_reference_action"):
             self.remove_reference_action.setEnabled(False)
+        if hasattr(self, "compare_reference_action"):
+            self.compare_reference_action.setEnabled(False)
+
+    def _compare_with_reference(self) -> None:
+        acquisition = self._acquisition
+        reference = self._reference_item
+        if acquisition is None or reference is None:
+            QMessageBox.information(
+                self, "Comparación", "Abra una adquisición y una señal de referencia."
+            )
+            return
+        names = [channel.name for channel in acquisition.channels]
+        selected, accepted = QInputDialog.getItem(
+            self,
+            "Comparar con referencia",
+            "Canal actual:",
+            names,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        channel_index = names.index(selected)
+        scope = self._analysis_slice()
+        try:
+            comparison = compare_reference(
+                acquisition.time[scope],
+                self._displayed_samples(channel_index)[scope],
+                np.asarray(reference.xData, dtype=np.float64) + reference.pos().x(),
+                np.asarray(reference.yData, dtype=np.float64) + reference.pos().y(),
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "No se pudo comparar", str(exc))
+            return
+        self._last_reference_comparison = comparison
+        dialog = ReferenceComparisonDialog(
+            comparison,
+            selected,
+            reference.name() or "Referencia",
+            self._reference_error_item is not None,
+            self._set_reference_error_visible,
+            self,
+        )
+        dialog.exec()
+
+    def _set_reference_error_visible(self, visible: bool) -> None:
+        comparison = self._last_reference_comparison
+        if self._reference_error_item is not None:
+            self.plot.removeItem(self._reference_error_item)
+        self._reference_error_item = None
+        if not visible or comparison is None:
+            return
+        self._reference_error_item = self.plot.plot(
+            comparison.time,
+            comparison.error,
+            pen=pg.mkPen("#ff4ecd", width=1.4),
+            name="ERROR Actual − Referencia",
+        )
+
+    def _remove_reference_error(self) -> None:
+        if self._reference_error_item is not None:
+            self.plot.removeItem(self._reference_error_item)
+        self._reference_error_item = None
+        self._last_reference_comparison = None
 
     def _create_math_channel(self) -> None:
         acquisition = self._acquisition
@@ -1030,6 +1309,13 @@ class MainWindow(QMainWindow):
             event.accept()
             self._show_plot_context_menu(event.screenPos().toPoint())
             return
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            and self._try_toggle_reference_at(event.scenePos())
+        ):
+            event.accept()
+            return
         if event.button() != Qt.MouseButton.LeftButton or self._placing_cursor is None:
             return
         position = self.view_box.mapSceneToView(event.scenePos())
@@ -1062,7 +1348,10 @@ class MainWindow(QMainWindow):
 
     def _set_stats_overlay_visible(self, visible: bool) -> None:
         self._show_stats_overlay = visible
-        self.stats_overlay.setVisible(visible)
+        if visible and self._acquisition is not None:
+            self._refresh_measurements()
+        else:
+            self.stats_overlay.setVisible(False)
 
     def _any_cursor_visible(self) -> bool:
         return self.show_x_cursors.isChecked() or self.show_y_cursors.isChecked()
@@ -1105,7 +1394,10 @@ class MainWindow(QMainWindow):
         self._native_probe_factors.clear()
         self._applied_probe_factors.clear()
         self._probe_controls.clear()
+        self._offset_controls.clear()
         self._coupling_modes = ["dc"] * len(result.acquisition.channels)
+        self._channel_inverted = [False] * len(result.acquisition.channels)
+        self._channel_display_offsets = [0.0] * len(result.acquisition.channels)
         self._coupling_cache.clear()
         self.pressure_enabled.setChecked(False)
         self._pressure_mode_active = False
@@ -1128,15 +1420,29 @@ class MainWindow(QMainWindow):
     def _draw_acquisition(self, acquisition: Acquisition) -> None:
         self.plot.clear()
         self._plot_items.clear()
+        for old_tag in self._channel_offset_tags:
+            old_tag.deleteLater()
+        self._channel_offset_tags.clear()
         self.plot.addLegend()
         for row, channel in enumerate(acquisition.channels):
             item = self.plot.plot(
                 acquisition.time,
-                channel.samples,
+                channel.samples + self._channel_display_offsets[row],
                 pen=pg.mkPen(CHANNEL_COLORS[row % len(CHANNEL_COLORS)], width=1),
                 name=channel.name,
             )
             self._plot_items.append(item)
+            tag = ChannelOffsetTag(
+                self.plot,
+                f"C{row + 1}",
+                CHANNEL_COLORS[row % len(CHANNEL_COLORS)],
+                lambda pixel_y, index=row: self._channel_offset_tag_moved(
+                    index, pixel_y
+                ),
+                lambda index=row: self._reset_single_channel_offset(index),
+            )
+            self._channel_offset_tags.append(tag)
+            tag.show()
         self.plot.addItem(self.region, ignoreBounds=True)
         self.plot.addItem(self.cursor_x1, ignoreBounds=True)
         self.plot.addItem(self.cursor_x2, ignoreBounds=True)
@@ -1157,6 +1463,7 @@ class MainWindow(QMainWindow):
         )
         self.plot.enableAutoRange(axis="y")
         self._update_time_div_label()
+        self._position_channel_offset_tags()
 
     def _populate_channel_panel(self, acquisition: Acquisition) -> None:
         self.channel_table.setRowCount(len(acquisition.channels))
@@ -1206,15 +1513,31 @@ class MainWindow(QMainWindow):
             self._probe_controls.append(probe_control)
             self.channel_table.setCellWidget(row, 2, probe_control)
 
+            offset_control = QDoubleSpinBox()
+            offset_control.setDecimals(6)
+            offset_control.setRange(-1e9, 1e9)
+            offset_control.setKeyboardTracking(False)
+            offset_control.setSuffix(f" {channel.unit}")
+            offset_control.setToolTip(
+                "Desplazamiento exclusivamente visual; no cambia mediciones ni muestras"
+            )
+            offset_control.valueChanged.connect(
+                lambda value, index=row: self._set_channel_display_offset(index, value)
+            )
+            self._offset_controls.append(offset_control)
+            self.channel_table.setCellWidget(row, 3, offset_control)
+
             solo_button = QPushButton("Solo")
             solo_button.setToolTip(f"Mostrar únicamente {channel.name}")
             solo_button.clicked.connect(lambda _checked=False, index=row: self._solo_channel(index))
-            self.channel_table.setCellWidget(row, 3, solo_button)
+            self.channel_table.setCellWidget(row, 4, solo_button)
         self.channel_table.resizeRowsToContents()
 
     def _set_channel_visible(self, index: int, visible: bool) -> None:
         if index < len(self._plot_items):
             self._plot_items[index].setVisible(visible)
+        if index < len(self._channel_offset_tags):
+            self._channel_offset_tags[index].setVisible(visible)
         self._refresh_measurements()
 
     def _set_probe_factor(self, index: int, factor: float) -> None:
@@ -1231,8 +1554,7 @@ class MainWindow(QMainWindow):
             self._applied_probe_factors[index] = factor
         self._coupling_cache.clear()
         samples = self._displayed_samples(index, factor)
-        if index < len(self._plot_items):
-            self._plot_items[index].setData(acquisition.time, samples)
+        self._update_plot_channel(index, factor)
         if index < len(self._channel_checks) and self._channel_checks[index].isChecked():
             visible = self._visible_channel_indices()
             if (
@@ -1268,6 +1590,12 @@ class MainWindow(QMainWindow):
 
     def _displayed_samples(self, index: int, factor: float | None = None) -> np.ndarray:
         voltage = self._samples_with_probe(index, factor)
+        if (
+            index < len(self._channel_inverted)
+            and self._channel_inverted[index]
+            and not self._pressure_enabled_for(index)
+        ):
+            voltage = np.asarray(-voltage, dtype=np.float32)
         voltage = self._apply_coupling(index, voltage, factor)
         if not self._pressure_enabled_for(index):
             return voltage
@@ -1280,6 +1608,120 @@ class MainWindow(QMainWindow):
         return np.asarray(
             self.pressure_min.value() + (voltage - voltage_min) * slope,
             dtype=np.float32,
+        )
+
+    def _plot_samples(self, index: int, factor: float | None = None) -> np.ndarray:
+        """Return transformed samples; visual offset is applied by the plot item."""
+        return self._displayed_samples(index, factor)
+
+    def _update_plot_channel(self, index: int, factor: float | None = None) -> None:
+        acquisition = self._acquisition
+        if acquisition is None or not 0 <= index < len(self._plot_items):
+            return
+        item = self._plot_items[index]
+        item.setData(acquisition.time, self._plot_samples(index, factor))
+        offset = (
+            self._channel_display_offsets[index]
+            if index < len(self._channel_display_offsets)
+            else 0.0
+        )
+        item.setPos(0.0, offset)
+
+    def _set_channel_display_offset(self, index: int, value: float) -> None:
+        acquisition = self._acquisition
+        if acquisition is None or not 0 <= index < len(acquisition.channels):
+            return
+        self._channel_display_offsets[index] = float(value)
+        if index < len(self._plot_items):
+            # Freeze the current V/div while the user positions one channel.
+            # Otherwise auto-range chases the trace and makes the tag appear to jump.
+            self.view_box.disableAutoRange(axis="y")
+            self._plot_items[index].setPos(0.0, value)
+        self._position_channel_offset_tags()
+        unit = self._display_unit(index)
+        self.statusBar().showMessage(
+            f"{acquisition.channels[index].name}: offset visual {value:+.6g} {unit} "
+            "(las mediciones no cambian)"
+        )
+
+    def _channel_offset_tag_moved(self, index: int, pixel_y: float) -> None:
+        scene_position = self.plot.mapToScene(QPoint(0, round(pixel_y)))
+        value = float(self.view_box.mapSceneToView(scene_position).y())
+        if index < len(self._offset_controls):
+            self._offset_controls[index].setValue(value)
+        else:
+            self._set_channel_display_offset(index, value)
+
+    def _position_channel_offset_tags(self, *_args: object) -> None:
+        if not self._channel_offset_tags:
+            return
+        plot_left = self.plot.mapFromScene(
+            QPointF(self.view_box.sceneBoundingRect().left(), 0.0)
+        ).x()
+        tag_x = max(0, plot_left - self._channel_offset_tags[0].width() - 3)
+        for index, tag in enumerate(self._channel_offset_tags):
+            if index >= len(self._channel_display_offsets):
+                continue
+            scene_position = self.view_box.mapViewToScene(
+                QPointF(0.0, self._channel_display_offsets[index])
+            )
+            widget_position = self.plot.mapFromScene(scene_position)
+            tag_y = widget_position.y() - tag.height() // 2
+            tag_y = min(max(tag_y, 0), max(self.plot.height() - tag.height(), 0))
+            tag.move(tag_x, tag_y)
+            tag.raise_()
+
+    def _reset_single_channel_offset(self, index: int) -> None:
+        if index < len(self._offset_controls):
+            self._offset_controls[index].setValue(0.0)
+        else:
+            self._set_channel_display_offset(index, 0.0)
+
+    def _reset_channel_offsets(self) -> None:
+        for index, control in enumerate(self._offset_controls):
+            control.setValue(0.0)
+            if index < len(self._channel_display_offsets):
+                self._channel_display_offsets[index] = 0.0
+            self._update_plot_channel(index)
+        self._auto_y()
+        self.statusBar().showMessage("Offsets visuales restablecidos")
+
+    def _auto_arrange_channels(self) -> None:
+        visible = self._visible_channel_indices()
+        if len(visible) < 2:
+            self.statusBar().showMessage(
+                "Muestra al menos dos canales para separarlos automáticamente"
+            )
+            return
+
+        summaries: list[tuple[int, float, float]] = []
+        for index in visible:
+            samples = self._displayed_samples(index)
+            step = max(1, samples.size // 100_000)
+            finite = samples[::step]
+            finite = finite[np.isfinite(finite)]
+            if finite.size == 0:
+                continue
+            low, high = np.percentile(finite, (5.0, 95.0))
+            center = float((low + high) / 2.0)
+            span = max(float(high - low), np.finfo(np.float32).eps)
+            summaries.append((index, center, span))
+        if len(summaries) < 2:
+            return
+
+        spacing = max(span for _index, _center, span in summaries) * 1.25
+        midpoint = (len(summaries) - 1) / 2.0
+        for position, (index, center, _span) in enumerate(summaries):
+            target_center = (midpoint - position) * spacing
+            offset = target_center - center
+            if index < len(self._offset_controls):
+                self._offset_controls[index].setValue(offset)
+            else:
+                self._channel_display_offsets[index] = offset
+                self._update_plot_channel(index)
+        self._auto_y()
+        self.statusBar().showMessage(
+            "Canales separados visualmente; las mediciones conservan sus valores reales"
         )
 
     def _apply_coupling(
@@ -1345,15 +1787,36 @@ class MainWindow(QMainWindow):
             return
         self._coupling_modes[index] = mode
         self._coupling_cache.clear()
-        self._plot_items[index].setData(
-            acquisition.time, self._displayed_samples(index)
-        )
+        self._update_plot_channel(index)
         self._update_channel_label(index)
         if self._channel_checks[index].isChecked():
             self._auto_y()
         label = dict(COUPLING_MODES)[mode]
         self.statusBar().showMessage(
             f"{acquisition.channels[index].name}: acoplamiento {label}"
+        )
+        self._refresh_measurements()
+
+    def _set_channel_inverted(self, index: int, inverted: bool) -> None:
+        acquisition = self._acquisition
+        if acquisition is None or not 0 <= index < len(acquisition.channels):
+            return
+        if self._pressure_enabled_for(index) and inverted:
+            QMessageBox.information(
+                self,
+                "Inversión no disponible",
+                "El compresímetro necesita conservar la polaridad absoluta del canal.",
+            )
+            return
+        self._channel_inverted[index] = inverted
+        self._coupling_cache.clear()
+        self._update_plot_channel(index)
+        self._update_channel_label(index)
+        if self._channel_checks[index].isChecked():
+            self._auto_y()
+        state = "invertida" if inverted else "normal"
+        self.statusBar().showMessage(
+            f"{acquisition.channels[index].name}: polaridad {state}"
         )
         self._refresh_measurements()
 
@@ -1366,8 +1829,9 @@ class MainWindow(QMainWindow):
         coupling = "DC"
         if index < len(self._coupling_modes):
             coupling = dict(COUPLING_MODES)[self._coupling_modes[index]].split(" —", 1)[0]
+        polarity = "  [INV]" if index < len(self._channel_inverted) and self._channel_inverted[index] else ""
         self.channel_table.item(index, 1).setText(
-            f"{channel.name}  [{unit}]  [{coupling}]"
+            f"{channel.name}  [{unit}]  [{coupling}]{polarity}"
         )
 
     def _display_unit(self, index: int) -> str:
@@ -1377,7 +1841,6 @@ class MainWindow(QMainWindow):
         return "PSI" if self._pressure_enabled_for(index) else acquisition.channels[index].unit
 
     def _apply_pressure_configuration(self, *_args: object) -> None:
-        acquisition = self._acquisition
         requested = self.pressure_enabled.isChecked()
         voltage_span = self.pressure_voltage_max.value() - self.pressure_voltage_min.value()
         if requested and np.isclose(voltage_span, 0.0):
@@ -1399,13 +1862,16 @@ class MainWindow(QMainWindow):
         selected = self.pressure_channel.currentIndex()
         if requested and 0 <= selected < len(self._coupling_modes):
             self._coupling_modes[selected] = "dc"
+            self._channel_inverted[selected] = False
             self._coupling_cache.clear()
         if requested and 0 <= selected < len(self._channel_checks):
             for index, checkbox in enumerate(self._channel_checks):
                 checkbox.setChecked(index == selected)
-        for index, item in enumerate(self._plot_items):
-            item.setData(acquisition.time, self._displayed_samples(index))
+        for index, _item in enumerate(self._plot_items):
+            self._update_plot_channel(index)
             self._update_channel_label(index)
+            if index < len(self._offset_controls):
+                self._offset_controls[index].setSuffix(f" {self._display_unit(index)}")
         vertical_axis = self.plot.plotItem.getAxis("left")
         vertical_axis.enableAutoSIPrefix(not requested)
         vertical_unit = "PSI" if requested else "V"
@@ -1873,6 +2339,36 @@ class MainWindow(QMainWindow):
 
         visible = self._visible_channel_indices()
         self.cursor_values.setRowCount(len(visible) if x_visible else 0)
+        needs_statistics = not self.statistics_panel.isHidden() or self._show_stats_overlay
+        if not needs_statistics:
+            self.statistics.setRowCount(0)
+            if x_visible:
+                for visible_row, channel_index in enumerate(visible):
+                    channel = acquisition.channels[channel_index]
+                    displayed_samples = self._displayed_samples(channel_index)
+                    display_unit = self._display_unit(channel_index)
+                    value1 = float(displayed_samples[index1])
+                    value2 = float(displayed_samples[index2])
+                    color = CHANNEL_COLORS[channel_index % len(CHANNEL_COLORS)]
+                    self._fill_row(
+                        self.cursor_values,
+                        visible_row,
+                        (
+                            channel.name,
+                            self._format_value(value1, display_unit),
+                            self._format_value(value2, display_unit),
+                            self._format_value(value2 - value1, display_unit),
+                        ),
+                        color,
+                    )
+            self._update_cursor_overlay(cursor_results)
+            self.stats_overlay.hide()
+            if self._cycle_reference is not None:
+                self._update_cycle_overlay()
+            self._position_overlays()
+            self._sync_numeric_cursors()
+            self._update_partition_lines()
+            return
         self.statistics.setRowCount(len(visible))
         stats_overlay_rows: list[tuple[str, str, str, str, str, str, str, str]] = []
         for visible_row, channel_index in enumerate(visible):

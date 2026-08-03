@@ -68,6 +68,10 @@ Las mediciones y transformaciones podrán usar:
 - Dibujarlo con estilo discontinuo y transparencia configurable.
 - Ajustar ganancia y desplazamiento vertical sin cambiar los datos.
 - Alinear por tiempo original, X1 o máximo absoluto dentro de X1–X2.
+- Seleccionar con `Ctrl + clic` y sincronizar tiempo/amplitud con `Ctrl + arrastrar` sobre la gráfica.
+- Calcular correlación, MAE, RMSE, error máximo, ganancia, offset, retardo residual,
+  diferencias de frecuencia/Duty y escala temporal estimada.
+- Mostrar opcionalmente la curva `Actual − Referencia`.
 - Quitar una referencia sin afectar el archivo.
 
 ### Interfaz
@@ -259,4 +263,3 @@ osc_app/
 - Decodificación completa de CAN, CAN-FD, LIN, SENT o FlexRay.
 - Editor arbitrario de expresiones Python.
 - Guardado completo de proyectos y preferencias persistentes.
-

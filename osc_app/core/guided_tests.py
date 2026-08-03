@@ -16,11 +16,23 @@ class GuidedTest:
 GUIDED_TESTS = (
     GuidedTest(
         "Compresión relativa",
-        "Comparar el esfuerzo de compresión entre cilindros durante el arranque.",
-        ("Pinza de corriente en el cable principal del motor de arranque.",),
-        ("Desactivar combustible/encendido.", "Capturar varios ciclos de arranque."),
-        ("Comparar amplitud entre eventos.", "Buscar un cilindro consistentemente bajo."),
-        "Use una pinza adecuada; nunca conecte una entrada de tensión en serie con el arranque.",
+        "Comparar el esfuerzo de compresión entre cilindros durante el arranque mediante "
+        "corriente del motor de arranque o caídas de tensión de batería.",
+        (
+            "Método recomendado: pinza de corriente en el cable principal del arranque.",
+            "Alternativa: medir tensión directamente entre los terminales de la batería.",
+        ),
+        (
+            "Desactivar combustible/encendido y capturar unos 5–6 segundos de arranque.",
+            "Con tensión de batería: usar AC, invertir polaridad y comenzar cerca de 1 V/div y 1 s/div.",
+            "Con pinza: seleccionar el rango alto, ponerla a cero y comenzar en DC.",
+        ),
+        (
+            "Comparar amplitud entre eventos repetidos.",
+            "Buscar un pico consistentemente bajo y confirmar con otro método.",
+        ),
+        "Use conexiones protegidas y sondas adecuadas. Evite cortocircuitar la batería; la "
+        "compresión relativa es comparativa y debe confirmarse antes de sustituir componentes.",
     ),
     GuidedTest(
         "Presión dentro del cilindro",

@@ -29,6 +29,7 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 - Visualización por picos o promedio visual.
 - Activación individual de canales y modo `Solo`.
 - Atenuación de sonda configurable por canal entre 0.01X y 1000X.
+- Acoplamiento DC, AC centrado, AC filtrado e inversión de polaridad por canal.
 - Cursores verticales X1/X2 y horizontales Y1/Y2, apagados al iniciar.
 - Colocación guiada, movimiento fino y etiquetas Y desplazables.
 - Región X1–X2 con estadísticas y valores por canal.
@@ -36,6 +37,10 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 - Tablas superpuestas movibles para cursores, estadísticas y ciclo motor.
 - Exportación PNG con las mediciones y superposiciones visibles.
 - Señales de referencia CSV/BIN con alineación, ganancia, offset y transparencia.
+- Offset visual independiente por canal, separación automática y restablecimiento,
+  sin modificar las muestras ni las mediciones eléctricas.
+- Etiquetas C1/C2/C3/C4 junto al eje Y: arrastre para desplazar el canal y doble
+  clic para regresar su offset a cero. Doble clic con la rueda restaura la vista.
 - Reglas X bloqueables, entrada numérica y hasta 32 particiones configurables.
 - Mediciones de flancos, pulsos, subida, bajada, overshoot, retardo y fase.
 - Seis pruebas automotrices guiadas con conexiones, preparación y seguridad.
@@ -144,6 +149,9 @@ Usa **Archivo → Abrir adquisición** para seleccionar un archivo `.csv` o `.bi
 | Abrir menú de gráfica | Clic derecho sobre la gráfica |
 | Guardar imagen | `Ctrl + S` |
 | Abrir señal de referencia | `Herramientas → Abrir señal de referencia` |
+| Seleccionar una referencia | `Ctrl + clic` sobre su trazo |
+| Sincronizar una referencia seleccionada | `Ctrl + arrastrar` sobre la gráfica |
+| Comparar matemáticamente con la referencia | `Herramientas → Comparar con referencia` |
 | Crear canal matemático | `Herramientas → Crear canal matemático` |
 | Analizar espectro | `Herramientas → Analizador FFT` |
 | Decodificar UART | `Herramientas → Decodificación UART` |
