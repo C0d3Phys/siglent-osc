@@ -6,7 +6,7 @@ import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_exporters
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtGui import QActionGroup, QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -24,9 +24,12 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+from scipy.signal import lfilter, lfilter_zi
 
 from osc_app.core.csv_importer import CsvImportError, GenericCsvImporter
 from osc_app.core.measurements import (
@@ -39,6 +42,12 @@ from osc_app.core.models import Acquisition
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
 
 CHANNEL_COLORS = ("#ffd43b", "#4dabf7", "#ff6b6b", "#69db7c")
+AC_FILTER_CUTOFF_HZ = 10.0
+COUPLING_MODES = (
+    ("dc", "DC"),
+    ("ac_mean", "AC — eliminar media"),
+    ("ac_filter", f"AC — filtro pasa-altos {AC_FILTER_CUTOFF_HZ:g} Hz"),
+)
 STATISTIC_COLUMNS = (
     "Canal",
     "Mínimo",
@@ -165,9 +174,11 @@ class MainWindow(QMainWindow):
         self._native_probe_factors: list[float] = []
         self._applied_probe_factors: list[float] = []
         self._probe_controls: list[QDoubleSpinBox] = []
+        self._coupling_modes: list[str] = []
+        self._coupling_cache: dict[tuple[int, str, float], np.ndarray] = {}
         self._placing_cursor: str | None = None
-        self._show_cursor_overlay = True
-        self._show_stats_overlay = True
+        self._show_cursor_overlay = False
+        self._show_stats_overlay = False
         self._pressure_mode_active = False
         self._cycle_reference: tuple[float, float] | None = None
         self._pending_cycle_start: float | None = None
@@ -181,8 +192,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self._build_plot()
-        channel_panel = self._build_channel_panel()
-        cursor_panel = self._build_cursor_panel()
+        self.channel_panel = self._build_channel_panel()
+        self.cursor_panel = self._build_cursor_panel()
 
         graph_panel = QWidget()
         graph_layout = QVBoxLayout(graph_panel)
@@ -190,6 +201,14 @@ class MainWindow(QMainWindow):
         graph_layout.addWidget(self.plot, 1)
 
         graph_buttons = QHBoxLayout()
+        graph_buttons.setSpacing(6)
+        graph_buttons.setContentsMargins(4, 2, 4, 2)
+        self.left_panel_button = QToolButton()
+        self.left_panel_button.setText("Canales")
+        self.left_panel_button.setCheckable(True)
+        self.left_panel_button.setChecked(False)
+        self.left_panel_button.setToolTip("Mostrar u ocultar el panel de canales")
+        self.left_panel_button.toggled.connect(self._set_channel_panel_visible)
         self.time_div_label = QLabel("Time/div: —")
         self.time_div_label.setMinimumWidth(145)
         self.time_div_label.setStyleSheet("font-weight: 600;")
@@ -209,12 +228,28 @@ class MainWindow(QMainWindow):
         zoom_y_out_button = QPushButton("Y −")
         zoom_y_out_button.setToolTip("Alejar la escala vertical")
         zoom_y_out_button.clicked.connect(lambda: self._zoom_y(1.4))
-        region_view_button = QPushButton("Zoom a región")
+        region_view_button = QPushButton("Región")
+        region_view_button.setToolTip("Ampliar la región delimitada por X1 y X2")
         region_view_button.clicked.connect(self._zoom_to_region)
-        full_view_button = QPushButton("Vista completa")
+        full_view_button = QPushButton("Todo")
+        full_view_button.setToolTip("Mostrar la adquisición completa")
         full_view_button.clicked.connect(self._show_full_view)
+        self.statistics_button = QToolButton()
+        self.statistics_button.setText("Estadísticas")
+        self.statistics_button.setCheckable(True)
+        self.statistics_button.setChecked(False)
+        self.statistics_button.setToolTip("Mostrar u ocultar la tabla inferior")
+        self.statistics_button.toggled.connect(self._set_statistics_panel_visible)
+        self.right_panel_button = QToolButton()
+        self.right_panel_button.setText("Herramientas")
+        self.right_panel_button.setCheckable(True)
+        self.right_panel_button.setChecked(False)
+        self.right_panel_button.setToolTip("Mostrar u ocultar cursores y ciclo motor")
+        self.right_panel_button.toggled.connect(self._set_cursor_panel_visible)
+        graph_buttons.addWidget(self.left_panel_button)
+        graph_buttons.addSpacing(8)
         graph_buttons.addWidget(self.time_div_label)
-        graph_buttons.addWidget(QLabel("Vista:"))
+        graph_buttons.addWidget(QLabel("Trazo:"))
         graph_buttons.addWidget(self.display_mode)
         graph_buttons.addStretch(1)
         graph_buttons.addWidget(auto_y_button)
@@ -222,14 +257,23 @@ class MainWindow(QMainWindow):
         graph_buttons.addWidget(zoom_y_out_button)
         graph_buttons.addWidget(region_view_button)
         graph_buttons.addWidget(full_view_button)
+        graph_buttons.addSpacing(8)
+        graph_buttons.addWidget(self.statistics_button)
+        graph_buttons.addWidget(self.right_panel_button)
         graph_layout.addLayout(graph_buttons)
 
-        upper_splitter = QSplitter(Qt.Orientation.Horizontal)
-        upper_splitter.addWidget(channel_panel)
-        upper_splitter.addWidget(graph_panel)
-        upper_splitter.addWidget(cursor_panel)
-        upper_splitter.setSizes([290, 720, 350])
-        upper_splitter.setStretchFactor(1, 1)
+        self.upper_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.upper_splitter.addWidget(self.channel_panel)
+        self.upper_splitter.addWidget(graph_panel)
+        self.upper_splitter.addWidget(self.cursor_panel)
+        self.upper_splitter.setSizes([0, 1200, 0])
+        self.upper_splitter.setStretchFactor(0, 0)
+        self.upper_splitter.setStretchFactor(1, 1)
+        self.upper_splitter.setStretchFactor(2, 0)
+        self.upper_splitter.setCollapsible(0, True)
+        self.upper_splitter.setCollapsible(2, True)
+        self.channel_panel.hide()
+        self.cursor_panel.hide()
 
         self.statistics = QTableWidget(0, len(STATISTIC_COLUMNS))
         self.statistics.setHorizontalHeaderLabels(STATISTIC_COLUMNS)
@@ -238,25 +282,27 @@ class MainWindow(QMainWindow):
         self.statistics.verticalHeader().setVisible(False)
         self.statistics.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
-        statistics_panel = QGroupBox("Estadísticas")
-        statistics_layout = QVBoxLayout(statistics_panel)
+        self.statistics_panel = QGroupBox("Estadísticas")
+        statistics_layout = QVBoxLayout(self.statistics_panel)
         self.use_region = QCheckBox("Calcular sobre la región X1–X2")
         self.use_region.setChecked(True)
         self.use_region.toggled.connect(self._refresh_measurements)
         statistics_layout.addWidget(self.use_region)
         statistics_layout.addWidget(self.statistics)
 
-        main_splitter = QSplitter(Qt.Orientation.Vertical)
-        main_splitter.addWidget(upper_splitter)
-        main_splitter.addWidget(statistics_panel)
-        main_splitter.setSizes([580, 180])
-        main_splitter.setStretchFactor(0, 4)
-        main_splitter.setStretchFactor(1, 1)
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_splitter.addWidget(self.upper_splitter)
+        self.main_splitter.addWidget(self.statistics_panel)
+        self.main_splitter.setSizes([700, 0])
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setCollapsible(1, True)
+        self.statistics_panel.hide()
 
         self.info = QLabel("Abra un CSV para comenzar.")
         self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout = QVBoxLayout()
-        layout.addWidget(main_splitter, 1)
+        layout.addWidget(self.main_splitter, 1)
         layout.addWidget(self.info)
         container = QWidget()
         container.setLayout(layout)
@@ -266,6 +312,9 @@ class MainWindow(QMainWindow):
     def _build_plot(self) -> None:
         self.view_box = OscilloscopeViewBox()
         plot_item = pg.PlotItem(viewBox=self.view_box)
+        self.plot_item = plot_item
+        self.graph_navigation_menu = self.view_box.menu
+        plot_item.setMenuEnabled(False)
         self.plot = pg.PlotWidget(background="#101419", plotItem=plot_item)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setLabel("bottom", "Tiempo", units="s")
@@ -325,8 +374,8 @@ class MainWindow(QMainWindow):
         self.cursor_x2.sigPositionChanged.connect(self._x_cursor_dragged)
         self.cursor_x1.sigPositionChangeFinished.connect(self._x_cursor_finished)
         self.cursor_x2.sigPositionChangeFinished.connect(self._x_cursor_finished)
-        self.cursor_y1.sigPositionChanged.connect(self._refresh_measurements)
-        self.cursor_y2.sigPositionChanged.connect(self._refresh_measurements)
+        self.cursor_y1.sigPositionChangeFinished.connect(self._refresh_measurements)
+        self.cursor_y2.sigPositionChangeFinished.connect(self._refresh_measurements)
         self.region.sigRegionChanged.connect(self._region_dragged)
         self.region.sigRegionChangeFinished.connect(self._region_finished)
 
@@ -404,8 +453,12 @@ class MainWindow(QMainWindow):
         buttons.addWidget(hide_all)
         layout.addLayout(buttons)
 
-        pressure_group = QGroupBox("Compresímetro")
-        pressure_layout = QFormLayout(pressure_group)
+        self.pressure_group = QGroupBox("Compresímetro (avanzado)")
+        self.pressure_group.setCheckable(True)
+        self.pressure_group.setChecked(False)
+        pressure_outer_layout = QVBoxLayout(self.pressure_group)
+        self.pressure_content = QWidget()
+        pressure_layout = QFormLayout(self.pressure_content)
         self.pressure_enabled = QCheckBox("Mostrar y medir en PSI")
         self.pressure_channel = QComboBox()
         self.pressure_voltage_min = self._pressure_spin(-1000.0, 1000.0, 0.0, " V")
@@ -424,6 +477,9 @@ class MainWindow(QMainWindow):
         self.pressure_calibration = QLabel("Ganancia: 100 PSI/V")
         self.pressure_calibration.setWordWrap(True)
         pressure_layout.addRow(self.pressure_calibration)
+        pressure_outer_layout.addWidget(self.pressure_content)
+        self.pressure_content.hide()
+        self.pressure_group.toggled.connect(self.pressure_content.setVisible)
         self.pressure_enabled.toggled.connect(self._apply_pressure_configuration)
         self.pressure_channel.currentIndexChanged.connect(self._apply_pressure_configuration)
         for control in (
@@ -434,7 +490,7 @@ class MainWindow(QMainWindow):
             self.pressure_gain,
         ):
             control.valueChanged.connect(self._apply_pressure_configuration)
-        layout.addWidget(pressure_group)
+        layout.addWidget(self.pressure_group)
         return panel
 
     @staticmethod
@@ -449,8 +505,14 @@ class MainWindow(QMainWindow):
         return control
 
     def _build_cursor_panel(self) -> QWidget:
-        panel = QGroupBox("Cursores")
+        panel = QGroupBox("Herramientas")
         layout = QVBoxLayout(panel)
+        tabs = QTabWidget()
+        cursor_tab = QWidget()
+        cursor_layout = QVBoxLayout(cursor_tab)
+        cycle_tab = QWidget()
+        cycle_layout = QVBoxLayout(cycle_tab)
+
         cursor_switches = QHBoxLayout()
         self.show_x_cursors = QCheckBox("Verticales X")
         self.show_x_cursors.setChecked(False)
@@ -460,17 +522,15 @@ class MainWindow(QMainWindow):
         self.show_y_cursors.toggled.connect(self._toggle_y_cursors)
         cursor_switches.addWidget(self.show_x_cursors)
         cursor_switches.addWidget(self.show_y_cursors)
-        layout.addLayout(cursor_switches)
+        cursor_layout.addLayout(cursor_switches)
         self.snap_x_to_samples = QCheckBox("Ajustar X a la muestra al soltar")
         self.snap_x_to_samples.setChecked(False)
         self.snap_x_to_samples.setToolTip(
             "Si está desactivado, X1 y X2 permanecen exactamente donde se sueltan"
         )
         self.snap_x_to_samples.toggled.connect(self._snap_option_changed)
-        layout.addWidget(self.snap_x_to_samples)
+        cursor_layout.addWidget(self.snap_x_to_samples)
 
-        cycle_group = QGroupBox("Ciclo motor 0°–720°")
-        cycle_layout = QVBoxLayout(cycle_group)
         self.define_cycle_button = QPushButton("Marcar 0° y 720°")
         self.define_cycle_button.setToolTip(
             "Seleccione primero el inicio 0° y después el final 720° sobre la señal"
@@ -491,7 +551,7 @@ class MainWindow(QMainWindow):
         self.cycle_summary = QLabel("Sin referencia angular")
         self.cycle_summary.setWordWrap(True)
         cycle_layout.addWidget(self.cycle_summary)
-        layout.addWidget(cycle_group)
+        cycle_layout.addStretch(1)
 
         self.cursor_metrics = QTableWidget(len(CURSOR_ROWS), 2)
         self.cursor_metrics.setHorizontalHeaderLabels(["Medida", "Resultado"])
@@ -503,19 +563,22 @@ class MainWindow(QMainWindow):
             self.cursor_metrics.setItem(row, 0, QTableWidgetItem(label))
             self.cursor_metrics.setItem(row, 1, QTableWidgetItem("—"))
             self.cursor_metrics.setRowHeight(row, 23)
-        self.cursor_metrics.setMinimumHeight(275)
-        self.cursor_metrics.setMaximumHeight(370)
-        layout.addWidget(self.cursor_metrics)
+        self.cursor_metrics.setMinimumHeight(250)
+        cursor_layout.addWidget(self.cursor_metrics, 2)
 
         values_label = QLabel("Valores por canal")
         values_label.setStyleSheet("font-weight: 600;")
-        layout.addWidget(values_label)
+        cursor_layout.addWidget(values_label)
         self.cursor_values = QTableWidget(0, len(CURSOR_VALUE_COLUMNS))
         self.cursor_values.setHorizontalHeaderLabels(CURSOR_VALUE_COLUMNS)
         self.cursor_values.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.cursor_values.verticalHeader().setVisible(False)
         self.cursor_values.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.cursor_values, 1)
+        cursor_layout.addWidget(self.cursor_values, 1)
+
+        tabs.addTab(cursor_tab, "Cursores")
+        tabs.addTab(cycle_tab, "Ciclo motor")
+        layout.addWidget(tabs)
         return panel
 
     def _build_menu(self) -> None:
@@ -530,11 +593,138 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("&Salir", self.close)
 
-        view_menu = self.menuBar().addMenu("&Vista")
+        channels_menu = self.menuBar().addMenu("&Canales")
+        channels_menu.addAction("Mostrar todos", self._show_all_channels)
+        channels_menu.addAction("Ocultar todos", self._hide_all_channels)
+        channels_menu.addSeparator()
+        channels_menu.addAction(
+            "Configurar compresímetro…", lambda: self.pressure_group.setChecked(True)
+        )
+
+        cursors_menu = self.menuBar().addMenu("C&ursores")
+        x_action = cursors_menu.addAction("Verticales X1/X2")
+        x_action.setCheckable(True)
+        x_action.setChecked(self.show_x_cursors.isChecked())
+        x_action.toggled.connect(self.show_x_cursors.setChecked)
+        self.show_x_cursors.toggled.connect(x_action.setChecked)
+        y_action = cursors_menu.addAction("Horizontales Y1/Y2")
+        y_action.setCheckable(True)
+        y_action.setChecked(self.show_y_cursors.isChecked())
+        y_action.toggled.connect(self.show_y_cursors.setChecked)
+        self.show_y_cursors.toggled.connect(y_action.setChecked)
+
+        tools_menu = self.menuBar().addMenu("&Herramientas")
+        self.coupling_menu = tools_menu.addMenu("Acoplamiento DC/AC por canal")
+        self.coupling_menu.aboutToShow.connect(self._rebuild_coupling_menu)
+
+        analysis_menu = self.menuBar().addMenu("&Análisis")
+        analysis_menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
+        analysis_menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
+        analysis_menu.addSeparator()
+        analysis_menu.addAction("Zoom a región X1–X2", self._zoom_to_region)
+
+        view_menu = self.menuBar().addMenu("&Opciones")
         view_menu.addAction("Vista completa", self._show_full_view)
-        view_menu.addAction("Zoom a región", self._zoom_to_region)
+        view_menu.addAction("Auto Y", self._auto_y)
         view_menu.addSeparator()
-        view_menu.addAction("Mostrar todos los canales", self._show_all_channels)
+        self.channel_panel_action = view_menu.addAction("Panel de canales")
+        self.channel_panel_action.setCheckable(True)
+        self.channel_panel_action.setChecked(False)
+        self.channel_panel_action.toggled.connect(self._set_channel_panel_visible)
+        self.cursor_panel_action = view_menu.addAction("Panel de herramientas")
+        self.cursor_panel_action.setCheckable(True)
+        self.cursor_panel_action.setChecked(False)
+        self.cursor_panel_action.toggled.connect(self._set_cursor_panel_visible)
+        self.statistics_panel_action = view_menu.addAction("Panel de estadísticas")
+        self.statistics_panel_action.setCheckable(True)
+        self.statistics_panel_action.setChecked(False)
+        self.statistics_panel_action.toggled.connect(self._set_statistics_panel_visible)
+        view_menu.addSeparator()
+        cursor_overlay_action = view_menu.addAction("Tabla superpuesta de cursores")
+        cursor_overlay_action.setCheckable(True)
+        cursor_overlay_action.setChecked(self._show_cursor_overlay)
+        cursor_overlay_action.toggled.connect(self._set_cursor_overlay_visible)
+        stats_overlay_action = view_menu.addAction("Tabla superpuesta de estadísticas")
+        stats_overlay_action.setCheckable(True)
+        stats_overlay_action.setChecked(self._show_stats_overlay)
+        stats_overlay_action.toggled.connect(self._set_stats_overlay_visible)
+        view_menu.addSeparator()
+        self.graph_navigation_menu.setTitle("Navegación y ejes")
+        self._translate_plot_menu(self.graph_navigation_menu)
+        self.plot_item.ctrlMenu.setTitle("Opciones de trazado")
+        self._translate_plot_menu(self.plot_item.ctrlMenu)
+        view_menu.addMenu(self.graph_navigation_menu)
+        view_menu.addMenu(self.plot_item.ctrlMenu)
+
+    @staticmethod
+    def _translate_plot_menu(menu: QMenu) -> None:
+        translations = {
+            "View All": "Ver todo",
+            "X axis": "Eje X",
+            "Y axis": "Eje Y",
+            "Mouse Mode": "Modo del ratón",
+            "Transforms": "Transformaciones",
+            "Downsample": "Reducción de muestras",
+            "Average": "Promedio",
+            "Alpha": "Transparencia",
+            "Grid": "Cuadrícula",
+            "Points": "Puntos",
+        }
+        for action in menu.actions():
+            if action.text() in translations:
+                action.setText(translations[action.text()])
+            if action.menu() is not None:
+                MainWindow._translate_plot_menu(action.menu())
+
+    def _set_channel_panel_visible(self, visible: bool) -> None:
+        self.channel_panel.setVisible(visible)
+        self.left_panel_button.setChecked(visible)
+        if hasattr(self, "channel_panel_action"):
+            self.channel_panel_action.setChecked(visible)
+
+    def _set_cursor_panel_visible(self, visible: bool) -> None:
+        self.cursor_panel.setVisible(visible)
+        self.right_panel_button.setChecked(visible)
+        if hasattr(self, "cursor_panel_action"):
+            self.cursor_panel_action.setChecked(visible)
+
+    def _set_statistics_panel_visible(self, visible: bool) -> None:
+        self.statistics_panel.setVisible(visible)
+        self.statistics_button.setChecked(visible)
+        if hasattr(self, "statistics_panel_action"):
+            self.statistics_panel_action.setChecked(visible)
+        if visible:
+            upper_height = max(self.main_splitter.height() - 190, 320)
+            self.main_splitter.setSizes([upper_height, 190])
+
+    def _rebuild_coupling_menu(self) -> None:
+        self.coupling_menu.clear()
+        acquisition = self._acquisition
+        if acquisition is None:
+            unavailable = self.coupling_menu.addAction("Abra una adquisición primero")
+            unavailable.setEnabled(False)
+            return
+        pressure_channel = self.pressure_channel.currentIndex()
+        for index, channel in enumerate(acquisition.channels):
+            channel_menu = self.coupling_menu.addMenu(channel.name)
+            action_group = QActionGroup(channel_menu)
+            action_group.setExclusive(True)
+            pressure_locked = self._pressure_mode_active and index == pressure_channel
+            for mode, label in COUPLING_MODES:
+                action = channel_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(self._coupling_modes[index] == mode)
+                action.setEnabled(not pressure_locked or mode == "dc")
+                action_group.addAction(action)
+                action.triggered.connect(
+                    lambda checked=False, channel_index=index, selected_mode=mode: (
+                        self._set_coupling_mode(channel_index, selected_mode)
+                        if checked
+                        else None
+                    )
+                )
+            if pressure_locked:
+                channel_menu.setToolTip("El compresímetro requiere acoplamiento DC")
 
     def choose_acquisition(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
@@ -586,11 +776,11 @@ class MainWindow(QMainWindow):
 
     def _show_plot_context_menu(self, screen_position) -> None:
         menu = QMenu(self)
-        x_action = menu.addAction("Cursores verticales X1/X2")
+        x_action = menu.addAction("Colocar cursores verticales X1/X2")
         x_action.setCheckable(True)
         x_action.setChecked(self.show_x_cursors.isChecked())
         x_action.toggled.connect(self.show_x_cursors.setChecked)
-        y_action = menu.addAction("Cursores horizontales Y1/Y2")
+        y_action = menu.addAction("Colocar cursores horizontales Y1/Y2")
         y_action.setCheckable(True)
         y_action.setChecked(self.show_y_cursors.isChecked())
         y_action.toggled.connect(self.show_y_cursors.setChecked)
@@ -599,18 +789,9 @@ class MainWindow(QMainWindow):
         if self._cycle_reference is not None:
             menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
         menu.addSeparator()
-        cursor_table_action = menu.addAction("Tabla superpuesta de cursores")
-        cursor_table_action.setCheckable(True)
-        cursor_table_action.setChecked(self._show_cursor_overlay)
-        cursor_table_action.toggled.connect(self._set_cursor_overlay_visible)
-        stats_table_action = menu.addAction("Tabla superpuesta de estadísticas")
-        stats_table_action.setCheckable(True)
-        stats_table_action.setChecked(self._show_stats_overlay)
-        stats_table_action.toggled.connect(self._set_stats_overlay_visible)
-        menu.addSeparator()
         menu.addAction("Auto Y", self._auto_y)
+        menu.addAction("Zoom a región X1–X2", self._zoom_to_region)
         menu.addAction("Vista completa", self._show_full_view)
-        menu.addAction("Guardar imagen…", self.save_plot_image)
         menu.exec(screen_position)
 
     def _set_cursor_overlay_visible(self, visible: bool) -> None:
@@ -660,6 +841,8 @@ class MainWindow(QMainWindow):
         self._native_probe_factors.clear()
         self._applied_probe_factors.clear()
         self._probe_controls.clear()
+        self._coupling_modes = ["dc"] * len(result.acquisition.channels)
+        self._coupling_cache.clear()
         self.pressure_enabled.setChecked(False)
         self._pressure_mode_active = False
         self._clear_cycle_reference()
@@ -731,7 +914,7 @@ class MainWindow(QMainWindow):
             self.channel_table.setCellWidget(row, 0, checkbox_container)
             self._channel_checks.append(checkbox)
 
-            channel_item = QTableWidgetItem(f"{channel.name}  [{channel.unit}]")
+            channel_item = QTableWidgetItem(f"{channel.name}  [{channel.unit}]  [DC]")
             channel_item.setForeground(QBrush(QColor(CHANNEL_COLORS[row % len(CHANNEL_COLORS)])))
             self.channel_table.setItem(row, 1, channel_item)
 
@@ -782,6 +965,7 @@ class MainWindow(QMainWindow):
         ratio = factor / previous_factor if previous_factor > 0 else 1.0
         if index < len(self._applied_probe_factors):
             self._applied_probe_factors[index] = factor
+        self._coupling_cache.clear()
         samples = self._displayed_samples(index, factor)
         if index < len(self._plot_items):
             self._plot_items[index].setData(acquisition.time, samples)
@@ -820,6 +1004,7 @@ class MainWindow(QMainWindow):
 
     def _displayed_samples(self, index: int, factor: float | None = None) -> np.ndarray:
         voltage = self._samples_with_probe(index, factor)
+        voltage = self._apply_coupling(index, voltage, factor)
         if not self._pressure_enabled_for(index):
             return voltage
         voltage_min = self.pressure_voltage_min.value()
@@ -831,6 +1016,94 @@ class MainWindow(QMainWindow):
         return np.asarray(
             self.pressure_min.value() + (voltage - voltage_min) * slope,
             dtype=np.float32,
+        )
+
+    def _apply_coupling(
+        self, index: int, samples: np.ndarray, factor: float | None = None
+    ) -> np.ndarray:
+        if index >= len(self._coupling_modes) or self._pressure_enabled_for(index):
+            return samples
+        mode = self._coupling_modes[index]
+        if mode == "dc" or samples.size == 0:
+            return samples
+        effective_factor = (
+            float(factor)
+            if factor is not None
+            else float(self._probe_controls[index].value())
+            if index < len(self._probe_controls)
+            else 1.0
+        )
+        cache_key = (index, mode, effective_factor)
+        cached = self._coupling_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        finite = np.isfinite(samples)
+        if not np.any(finite):
+            return samples
+        mean = float(np.mean(samples[finite], dtype=np.float64))
+        centered = np.asarray(samples - mean, dtype=np.float32)
+        if mode == "ac_mean":
+            result = centered
+        else:
+            acquisition = self._acquisition
+            sample_rate = acquisition.sample_rate if acquisition is not None else None
+            if sample_rate is None or sample_rate <= 0:
+                result = centered
+            else:
+                delta_time = 1.0 / sample_rate
+                rc = 1.0 / (2.0 * np.pi * AC_FILTER_CUTOFF_HZ)
+                alpha = rc / (rc + delta_time)
+                working = np.where(finite, samples, mean).astype(np.float64, copy=False)
+                initial_state = lfilter_zi((alpha, -alpha), (1.0, -alpha)) * working[0]
+                filtered, _ = lfilter(
+                    (alpha, -alpha), (1.0, -alpha), working, zi=initial_state
+                )
+                filtered[~finite] = np.nan
+                result = np.asarray(filtered, dtype=np.float32)
+        self._coupling_cache[cache_key] = result
+        return result
+
+    def _set_coupling_mode(self, index: int, mode: str) -> None:
+        acquisition = self._acquisition
+        valid_modes = {candidate for candidate, _label in COUPLING_MODES}
+        if (
+            acquisition is None
+            or not 0 <= index < len(acquisition.channels)
+            or mode not in valid_modes
+        ):
+            return
+        if self._pressure_enabled_for(index) and mode != "dc":
+            QMessageBox.information(
+                self,
+                "Acoplamiento no disponible",
+                "El compresímetro necesita conservar el nivel DC del canal.",
+            )
+            return
+        self._coupling_modes[index] = mode
+        self._coupling_cache.clear()
+        self._plot_items[index].setData(
+            acquisition.time, self._displayed_samples(index)
+        )
+        self._update_channel_label(index)
+        if self._channel_checks[index].isChecked():
+            self._auto_y()
+        label = dict(COUPLING_MODES)[mode]
+        self.statusBar().showMessage(
+            f"{acquisition.channels[index].name}: acoplamiento {label}"
+        )
+        self._refresh_measurements()
+
+    def _update_channel_label(self, index: int) -> None:
+        acquisition = self._acquisition
+        if acquisition is None or not 0 <= index < len(acquisition.channels):
+            return
+        channel = acquisition.channels[index]
+        unit = self._display_unit(index)
+        coupling = "DC"
+        if index < len(self._coupling_modes):
+            coupling = dict(COUPLING_MODES)[self._coupling_modes[index]].split(" —", 1)[0]
+        self.channel_table.item(index, 1).setText(
+            f"{channel.name}  [{unit}]  [{coupling}]"
         )
 
     def _display_unit(self, index: int) -> str:
@@ -860,14 +1133,15 @@ class MainWindow(QMainWindow):
             f"Ganancia efectiva: {slope:,.6g} PSI/V · sin recorte fuera del rango"
         )
         selected = self.pressure_channel.currentIndex()
+        if requested and 0 <= selected < len(self._coupling_modes):
+            self._coupling_modes[selected] = "dc"
+            self._coupling_cache.clear()
         if requested and 0 <= selected < len(self._channel_checks):
             for index, checkbox in enumerate(self._channel_checks):
                 checkbox.setChecked(index == selected)
         for index, item in enumerate(self._plot_items):
             item.setData(acquisition.time, self._displayed_samples(index))
-            channel = acquisition.channels[index]
-            label = self._display_unit(index)
-            self.channel_table.item(index, 1).setText(f"{channel.name}  [{label}]")
+            self._update_channel_label(index)
         vertical_axis = self.plot.plotItem.getAxis("left")
         vertical_axis.enableAutoSIPrefix(not requested)
         vertical_unit = "PSI" if requested else "V"
@@ -955,7 +1229,6 @@ class MainWindow(QMainWindow):
             sorted((float(self.cursor_x1.value()), float(self.cursor_x2.value())))
         )
         self._updating_selection = False
-        self._refresh_measurements()
 
     def _x_cursor_finished(self) -> None:
         if self._updating_selection or self._acquisition is None:
@@ -964,6 +1237,7 @@ class MainWindow(QMainWindow):
             self._set_selection(float(self.cursor_x1.value()), float(self.cursor_x2.value()))
         else:
             self._x_cursor_dragged()
+            self._refresh_measurements()
 
     def _region_dragged(self) -> None:
         if self._updating_selection or self._acquisition is None:
@@ -973,7 +1247,6 @@ class MainWindow(QMainWindow):
         self.cursor_x1.setValue(float(start))
         self.cursor_x2.setValue(float(end))
         self._updating_selection = False
-        self._refresh_measurements()
 
     def _region_finished(self) -> None:
         if self._updating_selection or self._acquisition is None:
@@ -983,6 +1256,7 @@ class MainWindow(QMainWindow):
             self._set_selection(float(start), float(end))
         else:
             self._region_dragged()
+            self._refresh_measurements()
 
     def _snap_option_changed(self, enabled: bool) -> None:
         if enabled and self._acquisition is not None:
@@ -997,6 +1271,7 @@ class MainWindow(QMainWindow):
         self._pending_cycle_start = None
         self._placing_cursor = "cycle0"
         self.statusBar().showMessage("Ciclo motor: haga clic en el punto de 0°")
+        self._refresh_measurements()
 
     def _clear_cycle_reference(self) -> None:
         self._cycle_reference = None
@@ -1021,6 +1296,7 @@ class MainWindow(QMainWindow):
         if end <= start:
             self._placing_cursor = "cycle720"
             self.statusBar().showMessage("El punto 720° debe estar a la derecha de 0°")
+            self._refresh_measurements()
             return
         self._cycle_reference = (start, end)
         self._pending_cycle_start = None
@@ -1185,6 +1461,7 @@ class MainWindow(QMainWindow):
             self._pending_cycle_start = x_value
             self._placing_cursor = "cycle720"
             self.statusBar().showMessage("Ciclo motor: haga clic en el punto de 720°")
+            self._refresh_measurements()
             return
         if self._placing_cursor == "cycle720":
             if self._pending_cycle_start is not None:
@@ -1195,6 +1472,7 @@ class MainWindow(QMainWindow):
             self.cursor_x1.show()
             self._placing_cursor = "x2"
             self.statusBar().showMessage("Cursores X: haga clic para colocar X2")
+            self._refresh_measurements()
             return
         if self._placing_cursor == "x2":
             self.cursor_x2.setValue(x_value)
@@ -1210,6 +1488,7 @@ class MainWindow(QMainWindow):
             self.cursor_y1.show()
             self._placing_cursor = "y2"
             self.statusBar().showMessage("Cursores Y: haga clic para colocar Y2")
+            self._refresh_measurements()
             return
         if self._placing_cursor == "y2":
             self.cursor_y2.setValue(y_value)
@@ -1329,9 +1608,20 @@ class MainWindow(QMainWindow):
         self._position_overlays()
 
     def _update_cursor_overlay(self, values: tuple[str, ...]) -> None:
-        if self._placing_cursor in ("x1", "x2"):
-            prompt = "Coloque X1" if self._placing_cursor == "x1" else "Coloque X2"
-            body = f"<tr><td colspan='2'><b>{prompt}</b></td></tr>"
+        placement_prompts = {
+            "x1": ("Cursores verticales", "Haga clic para colocar X1"),
+            "x2": ("Cursores verticales", "Haga clic para colocar X2"),
+            "y1": ("Cursores horizontales", "Haga clic para colocar Y1"),
+            "y2": ("Cursores horizontales", "Haga clic para colocar Y2"),
+            "cycle0": ("Ciclo motor", "Haga clic para colocar 0°"),
+            "cycle720": ("Ciclo motor", "Haga clic para colocar 720°"),
+        }
+        if self._placing_cursor in placement_prompts:
+            title, prompt = placement_prompts[self._placing_cursor]
+            body = (
+                "<tr><td><b style='color:#00e5ff'>" + title + "</b></td></tr>"
+                "<tr><td style='padding-top:4px'>" + prompt + "</td></tr>"
+            )
         else:
             rows: list[tuple[str, str]] = []
             if self.show_x_cursors.isChecked():
@@ -1350,7 +1640,10 @@ class MainWindow(QMainWindow):
             "<div style='color:#f2f4f8;font-size:10pt'>"
             "<table cellpadding='2'>" + body + "</table></div>"
         )
-        self.cursor_overlay.setVisible(self._show_cursor_overlay and self._any_cursor_visible())
+        self.cursor_overlay.setVisible(
+            self._placing_cursor in placement_prompts
+            or (self._show_cursor_overlay and self._any_cursor_visible())
+        )
 
     def _update_stats_overlay(
         self, rows: list[tuple[str, str, str, str, str, str, str, str]]
