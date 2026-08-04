@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "osc-app"
-version = "0.1.0"
+version = "0.2.0"
 description = "Analizador de adquisiciones CSV y BIN de osciloscopios SIGLENT"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,7 @@ keywords = ["oscilloscope", "siglent", "waveform", "csv", "binary", "signal-anal
 
 [project.optional-dependencies]
 dev = [
+    "pyinstaller>=6.11",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

@@ -51,3 +51,26 @@ def test_signal_values_are_finite_except_explicit_bad_cells(tmp_path: Path) -> N
 
     assert np.isnan(result.acquisition.channels[0].samples[1])
     assert result.report.warnings
+
+
+def test_accepts_hantek_square_bracket_headers(tmp_path: Path) -> None:
+    path = tmp_path / "hantek.csv"
+    path.write_text("Time [s],CH1 [V]\n0,0.1\n0.001,0.2\n", encoding="utf-8")
+
+    acquisition = GenericCsvImporter().load(path).acquisition
+
+    assert acquisition.channels[0].name == "CH1"
+    assert acquisition.channels[0].unit == "V"
+    assert acquisition.sample_rate == pytest.approx(1_000)
+
+
+def test_accepts_hantek_trailing_delimiters(tmp_path: Path) -> None:
+    path = tmp_path / "hantek.csv"
+    path.write_text(
+        "Time [s],CH1 [V]\n0,0.1,\n0.001,0.2,\n0.002,0.3,\n",
+        encoding="utf-8",
+    )
+
+    acquisition = GenericCsvImporter().load(path).acquisition
+
+    assert acquisition.sample_count == 3

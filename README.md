@@ -10,6 +10,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Estado](https://img.shields.io/badge/estado-alpha-orange)](#estado-del-proyecto)
+[![Versión](https://img.shields.io/badge/versión-0.2.0-blue)](https://github.com/C0d3Phys/siglent-osc/releases)
 
 OSC App es una aplicación de escritorio para abrir capturas extensas, navegar como en un
 osciloscopio y realizar mediciones sin modificar las muestras originales. El desarrollo actual
@@ -21,6 +22,7 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 ## Funciones actuales
 
 - Importación de CSV con eje temporal explícito y hasta cuatro canales.
+- Lectura directa del formato binario Hantek `.lwf`, sin requerir CSV ni REF.
 - Lectura experimental del BIN moderno SIGLENT de 8 bits.
 - Detección de canales activos, escala, offset, sonda, tasa de muestreo y trigger.
 - Capturas de hasta 14 Mpts verificadas con archivos reales.
@@ -98,6 +100,7 @@ o errores de cero.
 | Formato | Estado | Observaciones |
 |---|---|---|
 | CSV | Compatible | Tiempo explícito y columnas CH1–CH4 |
+| Hantek LWF binario | Experimental | Lectura autónoma; no requiere CSV, REF ni BMP |
 | SIGLENT BIN moderno de 8 bits | Experimental | Validado con cabecera `0x800` |
 | SIGLENT BIN de 16 bits | Pendiente | Se rechaza de forma segura |
 | BIN SIGLENT antiguo | Pendiente | Necesita un parser independiente |
@@ -106,6 +109,13 @@ o errores de cero.
 ## Instalación para desarrollo
 
 Requisitos: Windows 10/11 y Python 3.10 o superior.
+
+### Ejecutable para Windows
+
+La versión `v0.2.0` se distribuye como `OSC-App-v0.2.0-windows-x64.exe` desde la sección
+[Releases](https://github.com/C0d3Phys/siglent-osc/releases). Es un ejecutable autónomo: no
+requiere instalar Python. Descárgalo, ejecútalo y usa **Archivo → Abrir adquisición** para cargar
+CSV, BIN de SIGLENT o LWF de Hantek.
 
 ```powershell
 git clone https://github.com/C0d3Phys/siglent-osc.git
@@ -128,7 +138,20 @@ Después de la instalación también está disponible:
 osc-app
 ```
 
-Usa **Archivo → Abrir adquisición** para seleccionar un archivo `.csv` o `.bin`.
+Usa **Archivo → Abrir adquisición** para seleccionar un archivo `.csv`, `.bin` o `.lwf`. Para
+una captura Hantek también puedes usar **Archivo → Abrir captura Hantek** y seleccionar el
+binario `.lwf`; no se necesitan archivos CSV, REF ni BMP asociados.
+
+## Generar el ejecutable
+
+Con las dependencias de desarrollo instaladas:
+
+```powershell
+python -m PyInstaller OSC-App.spec --clean --noconfirm
+```
+
+El resultado se genera en `output/OSC-App.exe`. El archivo `.spec` incluye el logotipo y los
+recursos necesarios de la aplicación.
 
 ## Controles principales
 
@@ -182,8 +205,8 @@ python -m pytest
 ruff check .
 ```
 
-Actualmente existen 13 pruebas automatizadas para importación CSV/BIN, estadísticas, selección de
-muestras, frecuencia y Duty+.
+Actualmente existen 26 pruebas automatizadas para importación CSV/BIN/LWF, estadísticas,
+selección de muestras, frecuencia, Duty+ y herramientas de análisis.
 
 ## Estructura
 

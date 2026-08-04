@@ -9,9 +9,15 @@ import numpy as np
 
 from osc_app.core.models import Acquisition, Channel
 
-TIME_NAMES = {"time", "time(s)", "seconds", "second", "timestamp", "x"}
-CHANNEL_PATTERN = re.compile(r"^(?:ch|c|channel)\s*([1-4])(?:\s*\([^)]*\))?$", re.IGNORECASE)
-UNIT_PATTERN = re.compile(r"\(([^)]+)\)\s*$")
+TIME_PATTERN = re.compile(
+    r"^(?:time|timestamp|x)(?:\s*(?:\([^)]*\)|\[[^]]*\]))?$|^seconds?$",
+    re.IGNORECASE,
+)
+CHANNEL_PATTERN = re.compile(
+    r"^(?:ch|c|channel)\s*([1-4])(?:\s*(?:\([^)]*\)|\[[^]]*\]))?$",
+    re.IGNORECASE,
+)
+UNIT_PATTERN = re.compile(r"(?:\(([^)]+)\)|\[([^]]+)\])\s*$")
 
 
 class CsvImportError(ValueError):
@@ -145,13 +151,24 @@ class GenericCsvImporter:
         sample = "".join(lines)
         try:
             return csv.Sniffer().sniff(sample, delimiters=",;\t").delimiter
-        except csv.Error as exc:
-            raise CsvImportError("No se pudo detectar el delimitador del CSV.") from exc
+        except csv.Error:
+            # Algunos Hantek agregan una coma final a cada fila de datos pero no
+            # al encabezado; Sniffer interpreta esa columna vacia como irregular.
+            counts = {
+                delimiter: sum(line.rstrip("\r\n").rstrip(delimiter).count(delimiter) for line in lines)
+                for delimiter in (",", ";", "\t")
+            }
+            delimiter = max(counts, key=counts.get)
+            if counts[delimiter] > 0:
+                return delimiter
+            raise CsvImportError("No se pudo detectar el delimitador del CSV.")
 
     @staticmethod
     def _map_columns(header: list[str]) -> tuple[int, list[int]]:
         normalized = [value.strip().lower() for value in header]
-        time_candidates = [index for index, name in enumerate(normalized) if name in TIME_NAMES]
+        time_candidates = [
+            index for index, name in enumerate(normalized) if TIME_PATTERN.match(name)
+        ]
         if len(time_candidates) != 1:
             raise CsvImportError("Debe existir exactamente una columna de tiempo reconocible.")
         channel_indices = [
@@ -176,5 +193,4 @@ class GenericCsvImporter:
     @staticmethod
     def _unit(header: str, default: str) -> str:
         match = UNIT_PATTERN.search(header)
-        return match.group(1).strip() if match else default
-
+        return next(group.strip() for group in match.groups() if group is not None) if match else default

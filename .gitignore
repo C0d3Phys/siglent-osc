@@ -19,6 +19,7 @@ ENV/
 # Empaquetado y distribución
 build/
 dist/
+output/
 *.egg-info/
 *.egg
 *.whl
@@ -56,8 +57,12 @@ Desktop.ini
 *.mlg
 *.dat
 *.mat
+*.lwf
+*.ref
+*.bmp
 *.oscproj
 captures/
+hantek/
 projects/
 
 # Exportaciones generadas por la aplicación

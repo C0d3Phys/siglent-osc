@@ -45,6 +45,7 @@ from osc_app.core.advanced_measurements import (
     estimate_delay_and_phase,
 )
 from osc_app.core.csv_importer import CsvImportError, GenericCsvImporter
+from osc_app.core.hantek_importer import HantekImportError, HantekLwfImporter
 from osc_app.core.math_channels import calculate_math_channel
 from osc_app.core.measurements import (
     calculate_pulse_measurements,
@@ -294,6 +295,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("OSC App — Análisis de señales")
         self._importer = GenericCsvImporter()
+        self._hantek_importer = HantekLwfImporter()
         self._bin_importer = SiglentBinImporter()
         self._acquisition: Acquisition | None = None
         self._updating_selection = False
@@ -790,6 +792,8 @@ class MainWindow(QMainWindow):
         open_action = file_menu.addAction("&Abrir adquisición…")
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.choose_acquisition)
+        hantek_action = file_menu.addAction("Abrir captura &Hantek…")
+        hantek_action.triggered.connect(self.choose_hantek_capture)
         file_menu.addSeparator()
         save_image_action = file_menu.addAction("&Guardar imagen…")
         save_image_action.setShortcut("Ctrl+S")
@@ -985,10 +989,20 @@ class MainWindow(QMainWindow):
             self,
             "Abrir adquisición",
             str(Path.cwd()),
-            "Adquisiciones (*.csv *.bin);;CSV (*.csv);;SIGLENT BIN (*.bin);;Todos (*.*)",
+            "Adquisiciones (*.csv *.bin *.lwf);;Hantek LWF (*.lwf);;CSV (*.csv);;SIGLENT BIN (*.bin);;Todos (*.*)",
         )
         if selected:
             self.open_file(Path(selected))
+
+    def choose_hantek_capture(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Abrir captura Hantek",
+            str(Path.cwd()),
+            "Binario Hantek (*.lwf)",
+        )
+        if selected:
+            self.open_file(Path(selected), force_hantek=True)
 
     def _choose_reference(self) -> None:
         if self._acquisition is None:
@@ -1364,18 +1378,23 @@ class MainWindow(QMainWindow):
         """Abre un CSV o delega según la extensión para conservar compatibilidad."""
         self.open_file(path)
 
-    def open_file(self, path: Path) -> None:
+    def open_file(self, path: Path, *, force_hantek: bool = False) -> None:
         self.statusBar().showMessage(f"Importando {path.name}…")
         try:
-            if path.suffix.lower() == ".bin":
+            if force_hantek or path.suffix.lower() == ".lwf":
+                result = self._hantek_importer.load(path)
+                accepted = result.report.samples_per_channel
+            elif path.suffix.lower() == ".bin":
                 result = self._bin_importer.load(path)
                 accepted = result.report.samples_per_channel
             elif path.suffix.lower() == ".csv":
                 result = self._importer.load(path)
                 accepted = result.report.rows_accepted
             else:
-                raise ValueError("Formato no compatible. Seleccione un archivo .csv o .bin.")
-        except (BinImportError, CsvImportError, OSError, ValueError) as exc:
+                raise ValueError(
+                    "Formato no compatible. Seleccione CSV, BIN o una captura Hantek."
+                )
+        except (BinImportError, CsvImportError, HantekImportError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "No se pudo abrir la adquisición", str(exc))
             self.statusBar().showMessage("Error de importación")
             return
