@@ -11,6 +11,7 @@ Este directorio reúne la visión del producto y los documentos ejecutables de d
 | [development-plan.md](development-plan.md) | Etapas, riesgos y condiciones de salida |
 | [analysis-tools-roadmap.md](analysis-tools-roadmap.md) | Diseño y aceptación de referencias, reglas, mediciones, guías, matemáticas, FFT y serial |
 | [hantek-capture-format.md](hantek-capture-format.md) | Estructura y validación del binario autónomo Hantek LWF |
+| [ui-improvements.md](ui-improvements.md) | Registro de la primera tanda de mejoras de interfaz y decisiones de alcance |
 
 ## Precedencia
 

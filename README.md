@@ -50,6 +50,24 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 - Analizador FFT con ventanas, escala lineal/dB y conversión de pico a RPM.
 - Decodificación UART 8-N-1 inicial con tabla hexadecimal y validación de parada.
 
+## Interfaz
+
+- Barra de herramientas con íconos planos dibujados por código (no íconos nativos del
+  sistema) y tooltips, para abrir, guardar imagen, cursores X/Y, Auto Y, zoom a región,
+  vista completa, canal matemático y FFT. Se puede ocultar desde `Opciones → Barra de
+  herramientas` o haciendo clic derecho sobre ella.
+- Los tres paneles (Canales, Herramientas, Estadísticas) se muestran automáticamente al
+  importar una adquisición.
+- El panel de canales usa una tarjeta por canal, con un borde del color del trazo, casilla
+  de visibilidad, botón `Solo`, y los controles de Sonda y Offset en la misma fila.
+- Arrastrar y soltar un archivo `.csv`, `.bin` o `.lwf` sobre la ventana lo abre directamente.
+- Menú `Archivo → Abrir reciente` con los últimos archivos abiertos, persistente entre sesiones.
+- Resumen permanente bajo la gráfica con archivo, muestras, duración, tasa, canales activos
+  sobre el total y memoria estimada; se actualiza al importar y al mostrar u ocultar canales.
+- Atajos adicionales: `Ctrl+1/2/3` para los paneles de canales, herramientas y estadísticas;
+  `Ctrl+4/5` para cursores X/Y; `Ctrl+F` FFT; `Ctrl+M` canal matemático; `Ctrl+R` zoom a región;
+  `Ctrl+0` vista completa; `Ctrl+Y` Auto Y.
+
 ## Análisis de ciclo motor
 
 La referencia angular se define señalando primero `0°` y después `720°`. La aplicación:
@@ -170,16 +188,25 @@ recursos necesarios de la aplicación.
 | Medir presión | Configurar el sensor y activar `Mostrar y medir en PSI` |
 | Corregir voltaje real | Ajustar `Sonda` en el panel de canales |
 | Abrir menú de gráfica | Clic derecho sobre la gráfica |
-| Guardar imagen | `Ctrl + S` |
+| Abrir adquisición | `Ctrl + O`, botón de la barra de herramientas o arrastrar el archivo a la ventana |
+| Abrir un archivo reciente | `Archivo → Abrir reciente` |
+| Guardar imagen | `Ctrl + S` o botón de la barra de herramientas |
+| Mostrar u ocultar panel de canales | `Ctrl + 1` |
+| Mostrar u ocultar panel de herramientas | `Ctrl + 2` |
+| Mostrar u ocultar panel de estadísticas | `Ctrl + 3` |
+| Mostrar u ocultar cursores X1/X2 | `Ctrl + 4` |
+| Mostrar u ocultar cursores Y1/Y2 | `Ctrl + 5` |
+| Auto Y | `Ctrl + Y` o botón de la barra de herramientas |
+| Vista completa | `Ctrl + 0` o botón de la barra de herramientas |
+| Zoom a región X1–X2 | `Ctrl + R` o botón de la barra de herramientas |
 | Abrir señal de referencia | `Herramientas → Abrir señal de referencia` |
 | Seleccionar una referencia | `Ctrl + clic` sobre su trazo |
 | Sincronizar una referencia seleccionada | `Ctrl + arrastrar` sobre la gráfica |
 | Comparar matemáticamente con la referencia | `Herramientas → Comparar con referencia` |
-| Crear canal matemático | `Herramientas → Crear canal matemático` |
-| Analizar espectro | `Herramientas → Analizador FFT` |
+| Crear canal matemático | `Ctrl + M` o `Herramientas → Crear canal matemático` |
+| Analizar espectro | `Ctrl + F` o `Herramientas → Analizador FFT` |
 | Decodificar UART | `Herramientas → Decodificación UART` |
 | Abrir pruebas guiadas | `Análisis → Pruebas automotrices guiadas` |
-| Abrir adquisición | `Ctrl + O` |
 
 ## CSV sintético para pruebas
 
@@ -205,8 +232,11 @@ python -m pytest
 ruff check .
 ```
 
-Actualmente existen 26 pruebas automatizadas para importación CSV/BIN/LWF, estadísticas,
-selección de muestras, frecuencia, Duty+ y herramientas de análisis.
+Actualmente existen 57 pruebas automatizadas para importación CSV/BIN/LWF, estadísticas,
+selección de muestras, frecuencia, Duty+, herramientas de análisis y el comportamiento de la
+interfaz (barra de herramientas, apertura de paneles, tarjetas de canal, resumen de estado,
+archivos recientes y arrastrar-y-soltar). Las pruebas de interfaz usan Qt en modo `offscreen`
+(`tests/conftest.py` lo define por defecto) y no requieren un servidor gráfico.
 
 ## Estructura
 
@@ -215,10 +245,11 @@ siglent-osc/
 ├── docs/                  # Especificaciones y planificación
 ├── osc_app/
 │   ├── app/               # Interfaz PySide6 y PyQtGraph
-│   ├── core/              # Modelos, importadores y mediciones
+│   ├── core/              # Modelos, importadores, mediciones y utilidades de interfaz
 │   ├── resources/         # Logo y recursos empaquetados
 │   └── tools/             # Generadores y utilidades
 ├── tests/                 # Pruebas automatizadas
+├── CHANGELOG.md
 ├── CONTRIBUTING.md
 ├── README.md
 └── pyproject.toml
@@ -230,7 +261,9 @@ siglent-osc/
 - [Especificación general del producto](docs/product-specification.md)
 - [Especificación del MVP](docs/mvp-specification.md)
 - [Plan de desarrollo](docs/development-plan.md)
+- [Mejoras de interfaz](docs/ui-improvements.md)
 - [Guía para contribuir](CONTRIBUTING.md)
+- [Registro de cambios](CHANGELOG.md)
 
 ## Estado del proyecto
 

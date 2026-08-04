@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_exporters
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QActionGroup, QBrush, QColor
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+from PySide6.QtGui import QActionGroup, QBrush, QColor, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -23,11 +25,13 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QToolBar,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -35,6 +39,7 @@ from PySide6.QtWidgets import (
 from scipy.signal import lfilter, lfilter_zi
 
 from osc_app.app.guided_tests_dialog import GuidedTestsDialog
+from osc_app.app.icons import make_icon
 from osc_app.app.math_channel_dialog import MathChannelDialog
 from osc_app.app.reference_comparison_dialog import ReferenceComparisonDialog
 from osc_app.app.reference_dialog import ReferenceSettingsDialog
@@ -45,6 +50,7 @@ from osc_app.core.advanced_measurements import (
     estimate_delay_and_phase,
 )
 from osc_app.core.csv_importer import CsvImportError, GenericCsvImporter
+from osc_app.core.file_support import is_supported_acquisition_file
 from osc_app.core.hantek_importer import HantekImportError, HantekLwfImporter
 from osc_app.core.math_channels import calculate_math_channel
 from osc_app.core.measurements import (
@@ -54,8 +60,10 @@ from osc_app.core.measurements import (
     nearest_index,
 )
 from osc_app.core.models import Acquisition
+from osc_app.core.recent_files import MAX_RECENT_FILES, filter_existing_paths, push_recent_file
 from osc_app.core.references import compare_reference, reference_time_shift, transform_reference
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
+from osc_app.core.status_summary import build_status_summary, estimate_acquisition_memory_bytes
 
 CHANNEL_COLORS = ("#ffd43b", "#4dabf7", "#ff6b6b", "#69db7c")
 AC_FILTER_CUTOFF_HZ = 10.0
@@ -233,6 +241,92 @@ class ChannelOffsetTag(QLabel):
         super().mouseDoubleClickEvent(event)
 
 
+class ChannelCard(QFrame):
+    """Tarjeta compacta de un canal: identificada por color, con sonda y offset
+
+    en la misma fila. Reemplaza a las filas de una tabla, que se veían
+    apretadas y forzaban a los controles a envolverse en un espacio angosto.
+    """
+
+    def __init__(
+        self,
+        index: int,
+        name: str,
+        unit: str,
+        color: str,
+        *,
+        visibility_changed,
+        probe_changed,
+        offset_changed,
+        solo_requested,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.index = index
+        self.setObjectName("channelCard")
+        self.setStyleSheet(
+            "#channelCard {"
+            f"  border-left: 4px solid {color};"
+            "  background-color: rgba(255, 255, 255, 16);"
+            "  border-radius: 6px;"
+            "}"
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(3)
+
+        header = QHBoxLayout()
+        header.setSpacing(4)
+        self.visibility_checkbox = QCheckBox()
+        self.visibility_checkbox.setChecked(True)
+        self.visibility_checkbox.setToolTip(f"Mostrar u ocultar {name}")
+        self.visibility_checkbox.toggled.connect(
+            lambda checked: visibility_changed(index, checked)
+        )
+        header.addWidget(self.visibility_checkbox)
+        self.name_label = QLabel(f"{name}  [{unit}]  [DC]")
+        self.name_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        header.addWidget(self.name_label, 1)
+        solo_button = QPushButton("Solo")
+        solo_button.setFixedWidth(40)
+        solo_button.setToolTip(f"Mostrar únicamente {name}")
+        solo_button.clicked.connect(lambda: solo_requested(index))
+        header.addWidget(solo_button)
+        outer.addLayout(header)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(4)
+        probe_label = QLabel("Sonda")
+        probe_label.setStyleSheet("color: #9aa4b2;")
+        controls.addWidget(probe_label)
+        self.probe_control = QDoubleSpinBox()
+        self.probe_control.setDecimals(2)
+        self.probe_control.setRange(0.01, 1000.0)
+        self.probe_control.setSingleStep(1.0)
+        self.probe_control.setSuffix("X")
+        self.probe_control.setMaximumWidth(66)
+        self.probe_control.setToolTip(
+            "Factor de atenuación de la sonda. Ajusta voltajes, gráfica y mediciones."
+        )
+        self.probe_control.valueChanged.connect(lambda value: probe_changed(index, value))
+        controls.addWidget(self.probe_control)
+        offset_label = QLabel("Offset")
+        offset_label.setStyleSheet("color: #9aa4b2;")
+        controls.addWidget(offset_label)
+        self.offset_control = QDoubleSpinBox()
+        self.offset_control.setDecimals(3)
+        self.offset_control.setRange(-1e9, 1e9)
+        self.offset_control.setKeyboardTracking(False)
+        self.offset_control.setSuffix(f" {unit}")
+        self.offset_control.setMaximumWidth(90)
+        self.offset_control.setToolTip(
+            "Desplazamiento exclusivamente visual; no cambia mediciones ni muestras"
+        )
+        self.offset_control.valueChanged.connect(lambda value: offset_changed(index, value))
+        controls.addWidget(self.offset_control, 1)
+        outer.addLayout(controls)
+
+
 class DraggableTextItem(pg.TextItem):
     """Texto superpuesto que el usuario puede recolocar dentro de la gráfica."""
 
@@ -294,10 +388,13 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("OSC App — Análisis de señales")
+        self.setAcceptDrops(True)
+        self._settings = QSettings("OSCApp", "OSCApp")
         self._importer = GenericCsvImporter()
         self._hantek_importer = HantekLwfImporter()
         self._bin_importer = SiglentBinImporter()
         self._acquisition: Acquisition | None = None
+        self._current_file_name: str | None = None
         self._updating_selection = False
         self._plot_items: list[pg.PlotDataItem] = []
         self._reference_item: CtrlDraggableReferenceItem | None = None
@@ -332,6 +429,7 @@ class MainWindow(QMainWindow):
         }
         self._build_ui()
         self._build_menu()
+        self._build_toolbar()
 
     def _build_ui(self) -> None:
         self._build_plot()
@@ -588,22 +686,20 @@ class MainWindow(QMainWindow):
     def _build_channel_panel(self) -> QWidget:
         panel = QGroupBox("Canales")
         layout = QVBoxLayout(panel)
-        self.channel_table = QTableWidget(0, 5)
-        self.channel_table.setHorizontalHeaderLabels(
-            ["Ver", "Canal", "Sonda", "Offset visual", "Solo"]
-        )
-        self.channel_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.channel_table.verticalHeader().setVisible(False)
-        self.channel_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.channel_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.channel_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.channel_table.horizontalHeader().setSectionResizeMode(
-            3, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.channel_table.horizontalHeader().setSectionResizeMode(
-            4, QHeaderView.ResizeMode.ResizeToContents
-        )
-        layout.addWidget(self.channel_table, 1)
+
+        self.channel_cards: list[ChannelCard] = []
+        self._channel_cards_container = QWidget()
+        self._channel_cards_layout = QVBoxLayout(self._channel_cards_container)
+        self._channel_cards_layout.setContentsMargins(0, 0, 4, 0)
+        self._channel_cards_layout.setSpacing(6)
+        self._channel_cards_layout.addStretch(1)
+
+        channel_scroll = QScrollArea()
+        channel_scroll.setWidgetResizable(True)
+        channel_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        channel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        channel_scroll.setWidget(self._channel_cards_container)
+        layout.addWidget(channel_scroll, 1)
 
         show_all = QPushButton("Mostrar todos")
         show_all.clicked.connect(self._show_all_channels)
@@ -789,15 +885,19 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&Archivo")
-        open_action = file_menu.addAction("&Abrir adquisición…")
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self.choose_acquisition)
-        hantek_action = file_menu.addAction("Abrir captura &Hantek…")
-        hantek_action.triggered.connect(self.choose_hantek_capture)
+        self.open_action = file_menu.addAction("&Abrir adquisición…")
+        self.open_action.setShortcut("Ctrl+O")
+        self.open_action.setToolTip("Abrir un CSV, BIN o LWF (Ctrl+O)")
+        self.open_action.triggered.connect(self.choose_acquisition)
+        self.hantek_action = file_menu.addAction("Abrir captura &Hantek…")
+        self.hantek_action.triggered.connect(self.choose_hantek_capture)
+        self.recent_files_menu = file_menu.addMenu("Abrir &reciente")
+        self.recent_files_menu.aboutToShow.connect(self._rebuild_recent_files_menu)
         file_menu.addSeparator()
-        save_image_action = file_menu.addAction("&Guardar imagen…")
-        save_image_action.setShortcut("Ctrl+S")
-        save_image_action.triggered.connect(self.save_plot_image)
+        self.save_image_action = file_menu.addAction("&Guardar imagen…")
+        self.save_image_action.setShortcut("Ctrl+S")
+        self.save_image_action.setToolTip("Guardar la gráfica actual como PNG (Ctrl+S)")
+        self.save_image_action.triggered.connect(self.save_plot_image)
         file_menu.addSeparator()
         file_menu.addAction("&Salir", self.close)
 
@@ -813,16 +913,20 @@ class MainWindow(QMainWindow):
         )
 
         cursors_menu = self.menuBar().addMenu("C&ursores")
-        x_action = cursors_menu.addAction("Verticales X1/X2")
-        x_action.setCheckable(True)
-        x_action.setChecked(self.show_x_cursors.isChecked())
-        x_action.toggled.connect(self.show_x_cursors.setChecked)
-        self.show_x_cursors.toggled.connect(x_action.setChecked)
-        y_action = cursors_menu.addAction("Horizontales Y1/Y2")
-        y_action.setCheckable(True)
-        y_action.setChecked(self.show_y_cursors.isChecked())
-        y_action.toggled.connect(self.show_y_cursors.setChecked)
-        self.show_y_cursors.toggled.connect(y_action.setChecked)
+        self.toggle_x_cursors_action = cursors_menu.addAction("Verticales X1/X2")
+        self.toggle_x_cursors_action.setCheckable(True)
+        self.toggle_x_cursors_action.setChecked(self.show_x_cursors.isChecked())
+        self.toggle_x_cursors_action.setShortcut("Ctrl+4")
+        self.toggle_x_cursors_action.setToolTip("Mostrar u ocultar cursores X1/X2 (Ctrl+4)")
+        self.toggle_x_cursors_action.toggled.connect(self.show_x_cursors.setChecked)
+        self.show_x_cursors.toggled.connect(self.toggle_x_cursors_action.setChecked)
+        self.toggle_y_cursors_action = cursors_menu.addAction("Horizontales Y1/Y2")
+        self.toggle_y_cursors_action.setCheckable(True)
+        self.toggle_y_cursors_action.setChecked(self.show_y_cursors.isChecked())
+        self.toggle_y_cursors_action.setShortcut("Ctrl+5")
+        self.toggle_y_cursors_action.setToolTip("Mostrar u ocultar cursores Y1/Y2 (Ctrl+5)")
+        self.toggle_y_cursors_action.toggled.connect(self.show_y_cursors.setChecked)
+        self.show_y_cursors.toggled.connect(self.toggle_y_cursors_action.setChecked)
 
         tools_menu = self.menuBar().addMenu("&Herramientas")
         self.coupling_menu = tools_menu.addMenu("Acoplamiento DC/AC por canal")
@@ -838,13 +942,19 @@ class MainWindow(QMainWindow):
         )
         self.compare_reference_action.setEnabled(False)
         tools_menu.addSeparator()
-        tools_menu.addAction("Crear canal matemático…", self._create_math_channel)
+        self.math_channel_action = tools_menu.addAction(
+            "Crear canal matemático…", self._create_math_channel
+        )
+        self.math_channel_action.setShortcut("Ctrl+M")
+        self.math_channel_action.setToolTip("Crear un canal matemático (Ctrl+M)")
         self.remove_math_action = tools_menu.addAction(
             "Quitar canales matemáticos", self._remove_math_channels
         )
         self.remove_math_action.setEnabled(False)
         tools_menu.addSeparator()
-        tools_menu.addAction("Analizador FFT…", self._show_spectrum)
+        self.fft_action = tools_menu.addAction("Analizador FFT…", self._show_spectrum)
+        self.fft_action.setShortcut("Ctrl+F")
+        self.fft_action.setToolTip("Abrir el analizador FFT (Ctrl+F)")
         tools_menu.addAction("Decodificación UART…", self._show_serial_decoder)
 
         analysis_menu = self.menuBar().addMenu("&Análisis")
@@ -853,23 +963,38 @@ class MainWindow(QMainWindow):
         analysis_menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
         analysis_menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
         analysis_menu.addSeparator()
-        analysis_menu.addAction("Zoom a región X1–X2", self._zoom_to_region)
+        self.zoom_region_action = analysis_menu.addAction(
+            "Zoom a región X1–X2", self._zoom_to_region
+        )
+        self.zoom_region_action.setShortcut("Ctrl+R")
+        self.zoom_region_action.setToolTip("Ampliar la región X1–X2 (Ctrl+R)")
 
         view_menu = self.menuBar().addMenu("&Opciones")
-        view_menu.addAction("Vista completa", self._show_full_view)
-        view_menu.addAction("Auto Y", self._auto_y)
-        view_menu.addSeparator()
+        self.view_menu = view_menu
+        self.full_view_action = view_menu.addAction("Vista completa", self._show_full_view)
+        self.full_view_action.setShortcut("Ctrl+0")
+        self.full_view_action.setToolTip("Mostrar la adquisición completa (Ctrl+0)")
+        self.auto_y_action = view_menu.addAction("Auto Y", self._auto_y)
+        self.auto_y_action.setShortcut("Ctrl+Y")
+        self.auto_y_action.setToolTip("Ajustar la escala vertical automáticamente (Ctrl+Y)")
+        self._view_menu_panels_separator = view_menu.addSeparator()
         self.channel_panel_action = view_menu.addAction("Panel de canales")
         self.channel_panel_action.setCheckable(True)
         self.channel_panel_action.setChecked(False)
+        self.channel_panel_action.setShortcut("Ctrl+1")
+        self.channel_panel_action.setToolTip("Mostrar u ocultar el panel de canales (Ctrl+1)")
         self.channel_panel_action.toggled.connect(self._set_channel_panel_visible)
         self.cursor_panel_action = view_menu.addAction("Panel de herramientas")
         self.cursor_panel_action.setCheckable(True)
         self.cursor_panel_action.setChecked(False)
+        self.cursor_panel_action.setShortcut("Ctrl+2")
+        self.cursor_panel_action.setToolTip("Mostrar u ocultar cursores y ciclo motor (Ctrl+2)")
         self.cursor_panel_action.toggled.connect(self._set_cursor_panel_visible)
         self.statistics_panel_action = view_menu.addAction("Panel de estadísticas")
         self.statistics_panel_action.setCheckable(True)
         self.statistics_panel_action.setChecked(False)
+        self.statistics_panel_action.setShortcut("Ctrl+3")
+        self.statistics_panel_action.setToolTip("Mostrar u ocultar la tabla de estadísticas (Ctrl+3)")
         self.statistics_panel_action.toggled.connect(self._set_statistics_panel_visible)
         view_menu.addSeparator()
         cursor_overlay_action = view_menu.addAction("Tabla superpuesta de cursores")
@@ -887,6 +1012,52 @@ class MainWindow(QMainWindow):
         self._translate_plot_menu(self.plot_item.ctrlMenu)
         view_menu.addMenu(self.graph_navigation_menu)
         view_menu.addMenu(self.plot_item.ctrlMenu)
+
+    def _build_toolbar(self) -> None:
+        """Barra de herramientas con las acciones más usadas.
+
+        Los íconos se dibujan por código (``osc_app.app.icons``) en vez de usar
+        los íconos nativos del sistema, para evitar el aspecto inconsistente y
+        anticuado de los íconos estándar de Qt en distintas plataformas.
+        """
+        toolbar = QToolBar("Barra de herramientas", self)
+        toolbar.setObjectName("main_toolbar")
+        toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        icon_color = self.palette().color(QPalette.ColorRole.WindowText)
+
+        self.open_action.setIcon(make_icon("open", icon_color))
+        self.save_image_action.setIcon(make_icon("save_image", icon_color))
+        self.toggle_x_cursors_action.setIcon(make_icon("cursor_x", icon_color))
+        self.toggle_y_cursors_action.setIcon(make_icon("cursor_y", icon_color))
+        self.auto_y_action.setIcon(make_icon("auto_y", icon_color))
+        self.zoom_region_action.setIcon(make_icon("region", icon_color))
+        self.full_view_action.setIcon(make_icon("full_view", icon_color))
+        self.math_channel_action.setIcon(make_icon("math_channel", icon_color))
+        self.fft_action.setIcon(make_icon("fft", icon_color))
+
+        toolbar.addAction(self.open_action)
+        toolbar.addAction(self.save_image_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.toggle_x_cursors_action)
+        toolbar.addAction(self.toggle_y_cursors_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.auto_y_action)
+        toolbar.addAction(self.zoom_region_action)
+        toolbar.addAction(self.full_view_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.math_channel_action)
+        toolbar.addAction(self.fft_action)
+
+        self.main_toolbar = toolbar
+        self.addToolBar(toolbar)
+
+        self.toolbar_toggle_action = toolbar.toggleViewAction()
+        self.toolbar_toggle_action.setText("Barra de herramientas")
+        self.toolbar_toggle_action.setToolTip(
+            "Mostrar u ocultar la barra de herramientas superior"
+        )
+        self.view_menu.insertAction(self._view_menu_panels_separator, self.toolbar_toggle_action)
 
     @staticmethod
     def _translate_plot_menu(menu: QMenu) -> None:
@@ -929,7 +1100,7 @@ class MainWindow(QMainWindow):
 
     def _update_upper_splitter_sizes(self) -> None:
         total = max(self.upper_splitter.width(), 900)
-        channel_width = 300 if self.channel_panel.isVisible() else 0
+        channel_width = 330 if self.channel_panel.isVisible() else 0
         cursor_width = 340 if self.cursor_panel.isVisible() else 0
         graph_width = max(total - channel_width - cursor_width, 320)
         self.upper_splitter.setSizes([channel_width, graph_width, cursor_width])
@@ -1003,6 +1174,71 @@ class MainWindow(QMainWindow):
         )
         if selected:
             self.open_file(Path(selected), force_hantek=True)
+
+    # -- Archivos recientes ------------------------------------------------
+
+    def _load_recent_files(self) -> list[str]:
+        stored = self._settings.value("recent_files", [])
+        if not stored:
+            return []
+        paths = list(stored) if isinstance(stored, list) else [stored]
+        existing = filter_existing_paths(paths, os.path.exists)
+        if existing != paths:
+            self._settings.setValue("recent_files", existing)
+        return existing
+
+    def _remember_recent_file(self, path: Path) -> None:
+        stored = self._settings.value("recent_files", [])
+        existing = list(stored) if isinstance(stored, list) else ([stored] if stored else [])
+        updated = push_recent_file(existing, str(path), limit=MAX_RECENT_FILES)
+        self._settings.setValue("recent_files", updated)
+
+    def _clear_recent_files(self) -> None:
+        self._settings.setValue("recent_files", [])
+
+    def _rebuild_recent_files_menu(self) -> None:
+        self.recent_files_menu.clear()
+        recent = self._load_recent_files()
+        if not recent:
+            empty_action = self.recent_files_menu.addAction("(sin archivos recientes)")
+            empty_action.setEnabled(False)
+            return
+        for path_text in recent:
+            path = Path(path_text)
+            action = self.recent_files_menu.addAction(path.name)
+            action.setToolTip(path_text)
+            action.triggered.connect(lambda checked=False, p=path: self.open_file(p))
+        self.recent_files_menu.addSeparator()
+        self.recent_files_menu.addAction("Limpiar lista", self._clear_recent_files)
+
+    # -- Arrastrar y soltar --------------------------------------------------
+
+    def dragEnterEvent(self, event) -> None:
+        if self._acceptable_drop_path(event) is not None:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        path = self._acceptable_drop_path(event)
+        if path is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.open_file(path)
+
+    @staticmethod
+    def _acceptable_drop_path(event) -> Path | None:
+        mime_data = event.mimeData()
+        if not mime_data.hasUrls():
+            return None
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if is_supported_acquisition_file(path):
+                return path
+        return None
 
     def _choose_reference(self) -> None:
         if self._acquisition is None:
@@ -1421,20 +1657,36 @@ class MainWindow(QMainWindow):
         self.pressure_enabled.setChecked(False)
         self._pressure_mode_active = False
         self._clear_cycle_reference()
-        self.channel_table.setRowCount(0)
         self._draw_acquisition(result.acquisition)
         self._populate_channel_panel(result.acquisition)
         self._initialize_selection()
-        rate = result.acquisition.sample_rate
-        rate_text = f"{rate:,.3f} Sa/s" if rate else "no disponible"
-        self.info.setText(
-            f"{path.name}  |  {result.acquisition.sample_count:,} muestras  |  "
-            f"{result.acquisition.duration:.6g} s  |  {rate_text}  |  "
-            f"{len(result.acquisition.channels)} canales"
-        )
+        self._current_file_name = path.name
+        self._remember_recent_file(path)
+        self._set_channel_panel_visible(True)
+        self._set_cursor_panel_visible(True)
+        self._set_statistics_panel_visible(True)
+        self._refresh_status_summary()
         self.statusBar().showMessage(
             f"Importación completa: {accepted:,} muestras por canal"
         )
+
+    def _refresh_status_summary(self) -> None:
+        """Actualiza el resumen permanente (archivo, muestras, tasa, canales, memoria)."""
+        acquisition = self._acquisition
+        if acquisition is None:
+            self.info.setText("Abra un CSV para comenzar.")
+            return
+        active_channels = len(self._visible_channel_indices())
+        summary = build_status_summary(
+            file_name=self._current_file_name or acquisition.source_file.name,
+            sample_count=acquisition.sample_count,
+            duration=acquisition.duration,
+            sample_rate=acquisition.sample_rate,
+            active_channels=active_channels,
+            total_channels=len(acquisition.channels),
+            memory_bytes=estimate_acquisition_memory_bytes(acquisition),
+        )
+        self.info.setText(summary)
 
     def _draw_acquisition(self, acquisition: Acquisition) -> None:
         self.plot.clear()
@@ -1485,29 +1737,13 @@ class MainWindow(QMainWindow):
         self._position_channel_offset_tags()
 
     def _populate_channel_panel(self, acquisition: Acquisition) -> None:
-        self.channel_table.setRowCount(len(acquisition.channels))
         self._channel_checks.clear()
         self.pressure_channel.blockSignals(True)
         self.pressure_channel.clear()
         self.pressure_channel.addItems([channel.name for channel in acquisition.channels])
         self.pressure_channel.blockSignals(False)
+        self._clear_channel_cards()
         for row, channel in enumerate(acquisition.channels):
-            checkbox = QCheckBox()
-            checkbox.setChecked(True)
-            checkbox.setToolTip(f"Mostrar u ocultar {channel.name}")
-            checkbox.toggled.connect(lambda checked, index=row: self._set_channel_visible(index, checked))
-            checkbox_container = QWidget()
-            checkbox_layout = QHBoxLayout(checkbox_container)
-            checkbox_layout.setContentsMargins(0, 0, 0, 0)
-            checkbox_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            checkbox_layout.addWidget(checkbox)
-            self.channel_table.setCellWidget(row, 0, checkbox_container)
-            self._channel_checks.append(checkbox)
-
-            channel_item = QTableWidgetItem(f"{channel.name}  [{channel.unit}]  [DC]")
-            channel_item.setForeground(QBrush(QColor(CHANNEL_COLORS[row % len(CHANNEL_COLORS)])))
-            self.channel_table.setItem(row, 1, channel_item)
-
             metadata_key = f"{channel.name} Probe"
             try:
                 native_probe = float(acquisition.metadata.get(metadata_key, "1"))
@@ -1517,40 +1753,29 @@ class MainWindow(QMainWindow):
                 native_probe = 1.0
             self._native_probe_factors.append(native_probe)
             self._applied_probe_factors.append(native_probe)
-            probe_control = QDoubleSpinBox()
-            probe_control.setDecimals(2)
-            probe_control.setRange(0.01, 1000.0)
-            probe_control.setSingleStep(1.0)
-            probe_control.setSuffix("X")
-            probe_control.setValue(native_probe)
-            probe_control.setToolTip(
-                "Factor de atenuación de la sonda. Ajusta voltajes, gráfica y mediciones."
-            )
-            probe_control.valueChanged.connect(
-                lambda value, index=row: self._set_probe_factor(index, value)
-            )
-            self._probe_controls.append(probe_control)
-            self.channel_table.setCellWidget(row, 2, probe_control)
 
-            offset_control = QDoubleSpinBox()
-            offset_control.setDecimals(6)
-            offset_control.setRange(-1e9, 1e9)
-            offset_control.setKeyboardTracking(False)
-            offset_control.setSuffix(f" {channel.unit}")
-            offset_control.setToolTip(
-                "Desplazamiento exclusivamente visual; no cambia mediciones ni muestras"
+            card = ChannelCard(
+                row,
+                channel.name,
+                channel.unit,
+                CHANNEL_COLORS[row % len(CHANNEL_COLORS)],
+                visibility_changed=self._set_channel_visible,
+                probe_changed=self._set_probe_factor,
+                offset_changed=self._set_channel_display_offset,
+                solo_requested=self._solo_channel,
             )
-            offset_control.valueChanged.connect(
-                lambda value, index=row: self._set_channel_display_offset(index, value)
-            )
-            self._offset_controls.append(offset_control)
-            self.channel_table.setCellWidget(row, 3, offset_control)
+            card.probe_control.setValue(native_probe)
+            self._channel_cards_layout.insertWidget(row, card)
+            self.channel_cards.append(card)
+            self._channel_checks.append(card.visibility_checkbox)
+            self._probe_controls.append(card.probe_control)
+            self._offset_controls.append(card.offset_control)
 
-            solo_button = QPushButton("Solo")
-            solo_button.setToolTip(f"Mostrar únicamente {channel.name}")
-            solo_button.clicked.connect(lambda _checked=False, index=row: self._solo_channel(index))
-            self.channel_table.setCellWidget(row, 4, solo_button)
-        self.channel_table.resizeRowsToContents()
+    def _clear_channel_cards(self) -> None:
+        for card in self.channel_cards:
+            self._channel_cards_layout.removeWidget(card)
+            card.deleteLater()
+        self.channel_cards.clear()
 
     def _set_channel_visible(self, index: int, visible: bool) -> None:
         if index < len(self._plot_items):
@@ -1558,6 +1783,7 @@ class MainWindow(QMainWindow):
         if index < len(self._channel_offset_tags):
             self._channel_offset_tags[index].setVisible(visible)
         self._refresh_measurements()
+        self._refresh_status_summary()
 
     def _set_probe_factor(self, index: int, factor: float) -> None:
         acquisition = self._acquisition
@@ -1849,9 +2075,10 @@ class MainWindow(QMainWindow):
         if index < len(self._coupling_modes):
             coupling = dict(COUPLING_MODES)[self._coupling_modes[index]].split(" —", 1)[0]
         polarity = "  [INV]" if index < len(self._channel_inverted) and self._channel_inverted[index] else ""
-        self.channel_table.item(index, 1).setText(
-            f"{channel.name}  [{unit}]  [{coupling}]{polarity}"
-        )
+        if index < len(self.channel_cards):
+            self.channel_cards[index].name_label.setText(
+                f"{channel.name}  [{unit}]  [{coupling}]{polarity}"
+            )
 
     def _display_unit(self, index: int) -> str:
         acquisition = self._acquisition
