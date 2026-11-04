@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_exporters
-from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+from PySide6.QtCore import QObject, QPoint, QPointF, QSettings, Qt, QThread, Signal
 from PySide6.QtGui import QActionGroup, QBrush, QColor, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -382,6 +382,103 @@ class CtrlDraggableReferenceItem(pg.PlotDataItem):
             self.setPen(self._base_pen)
 
 
+class _StatisticsWorker(QObject):
+    """Calcula estadísticas, pulsos y flancos por canal fuera del hilo de la UI.
+
+    ``open_file()`` deja los tres paneles visibles al importar (incluido el de
+    Estadísticas), así que este cálculo -antes síncrono sobre la adquisición
+    completa en ``_refresh_measurements``- corría en el hilo de Qt y congelaba
+    la interfaz con capturas grandes (muchas muestras y/o muchos cruces de
+    flanco). Se ejecuta aquí en un QThread aparte; el resultado se aplica en
+    el hilo principal a través de señales, nunca tocando widgets desde este
+    hilo.
+    """
+
+    finished = Signal(int, list, object)
+    failed = Signal(int, str)
+
+    def __init__(
+        self,
+        request_id: int,
+        channel_specs: list[tuple[int, np.ndarray, np.ndarray]],
+        phase_specs: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    ) -> None:
+        super().__init__()
+        self._request_id = request_id
+        self._channel_specs = channel_specs
+        self._phase_specs = phase_specs
+
+    def run(self) -> None:
+        try:
+            results = []
+            for channel_index, time_slice, samples_slice in self._channel_specs:
+                statistics = calculate_statistics(samples_slice)
+                pulse = calculate_pulse_measurements(time_slice, samples_slice)
+                edges = calculate_edge_measurements(time_slice, samples_slice)
+                results.append((channel_index, statistics, pulse, edges))
+            phase_result = None
+            if self._phase_specs is not None:
+                scoped_time, first_channel, second_channel = self._phase_specs
+                reference_pulse = calculate_pulse_measurements(scoped_time, first_channel)
+                phase_result = estimate_delay_and_phase(
+                    scoped_time, first_channel, second_channel, reference_pulse.frequency
+                )
+        except Exception as exc:  # noqa: BLE001 - report to the UI instead of crashing the thread
+            self.failed.emit(self._request_id, str(exc))
+            return
+        self.finished.emit(self._request_id, results, phase_result)
+
+
+class _ImportWorker(QObject):
+    """Lee y decodifica un archivo de adquisición (CSV/BIN/LWF) fuera del hilo
+    de la UI. ``dropEvent()`` llama a ``open_file()`` directamente dentro del
+    callback OLE síncrono de arrastrar-y-soltar de Windows; si el parseo
+    corriera ahí, congelaría el gesto de arrastre completo, no solo el event
+    loop de Qt, con archivos grandes. El resultado se aplica en el hilo
+    principal a través de señales.
+    """
+
+    finished = Signal(int, object, object, object)  # request_id, result, path, accepted
+    failed = Signal(int, str)
+
+    def __init__(
+        self,
+        request_id: int,
+        path: Path,
+        force_hantek: bool,
+        csv_importer: GenericCsvImporter,
+        hantek_importer: HantekLwfImporter,
+        bin_importer: SiglentBinImporter,
+    ) -> None:
+        super().__init__()
+        self._request_id = request_id
+        self._path = path
+        self._force_hantek = force_hantek
+        self._csv_importer = csv_importer
+        self._hantek_importer = hantek_importer
+        self._bin_importer = bin_importer
+
+    def run(self) -> None:
+        try:
+            if self._force_hantek or self._path.suffix.lower() == ".lwf":
+                result = self._hantek_importer.load(self._path)
+                accepted = result.report.samples_per_channel
+            elif self._path.suffix.lower() == ".bin":
+                result = self._bin_importer.load(self._path)
+                accepted = result.report.samples_per_channel
+            elif self._path.suffix.lower() == ".csv":
+                result = self._csv_importer.load(self._path)
+                accepted = result.report.rows_accepted
+            else:
+                raise ValueError(
+                    "Formato no compatible. Seleccione CSV, BIN o una captura Hantek."
+                )
+        except (BinImportError, CsvImportError, HantekImportError, OSError, ValueError) as exc:
+            self.failed.emit(self._request_id, str(exc))
+            return
+        self.finished.emit(self._request_id, result, self._path, accepted)
+
+
 class MainWindow(QMainWindow):
     """Visor CSV con paneles fijos para canales, cursores y mediciones."""
 
@@ -427,6 +524,20 @@ class MainWindow(QMainWindow):
             "stats": (0.012, 0.025),
             "cycle": (0.5, 0.975),
         }
+        self._stats_request_id = 0
+        self._stats_worker_busy = False
+        self._stats_pending_args: tuple[
+            int,
+            list[tuple[int, np.ndarray, np.ndarray]],
+            tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+        ] | None = None
+        self._stats_thread: QThread | None = None
+        self._stats_worker: _StatisticsWorker | None = None
+        self._import_request_id = 0
+        self._import_worker_busy = False
+        self._import_pending_args: tuple[int, Path, bool] | None = None
+        self._import_thread: QThread | None = None
+        self._import_worker: _ImportWorker | None = None
         self._build_ui()
         self._build_menu()
         self._build_toolbar()
@@ -1615,25 +1726,71 @@ class MainWindow(QMainWindow):
         self.open_file(path)
 
     def open_file(self, path: Path, *, force_hantek: bool = False) -> None:
+        # La lectura/decodificación real (E/S de disco + parseo CSV o binario)
+        # corre en un hilo aparte vía _dispatch_import: dropEvent() llama a este
+        # método directamente dentro del callback OLE síncrono de arrastrar-y-
+        # soltar de Windows, así que si open_file() bloqueaba aquí, se congelaba
+        # el gesto de arrastre completo (no solo el event loop de Qt) con
+        # archivos grandes. open_file() ahora solo encola el trabajo y regresa
+        # de inmediato; _on_import_ready aplica el resultado en el hilo de la UI.
         self.statusBar().showMessage(f"Importando {path.name}…")
-        try:
-            if force_hantek or path.suffix.lower() == ".lwf":
-                result = self._hantek_importer.load(path)
-                accepted = result.report.samples_per_channel
-            elif path.suffix.lower() == ".bin":
-                result = self._bin_importer.load(path)
-                accepted = result.report.samples_per_channel
-            elif path.suffix.lower() == ".csv":
-                result = self._importer.load(path)
-                accepted = result.report.rows_accepted
-            else:
-                raise ValueError(
-                    "Formato no compatible. Seleccione CSV, BIN o una captura Hantek."
-                )
-        except (BinImportError, CsvImportError, HantekImportError, OSError, ValueError) as exc:
-            QMessageBox.critical(self, "No se pudo abrir la adquisición", str(exc))
-            self.statusBar().showMessage("Error de importación")
+        self._dispatch_import(Path(path), force_hantek=force_hantek)
+
+    def _dispatch_import(self, path: Path, *, force_hantek: bool) -> None:
+        self._import_request_id += 1
+        request_id = self._import_request_id
+        if self._import_worker_busy:
+            # Ya hay una importación en curso: se descarta cualquier pedido
+            # encolado anterior y se recuerda solo el más reciente (p. ej. el
+            # usuario suelta varios archivos seguidos) para lanzarlo en cuanto
+            # el actual termine.
+            self._import_pending_args = (request_id, path, force_hantek)
             return
+        self._start_import_worker(request_id, path, force_hantek)
+
+    def _start_import_worker(self, request_id: int, path: Path, force_hantek: bool) -> None:
+        self._import_worker_busy = True
+        thread = QThread(self)
+        worker = _ImportWorker(
+            request_id,
+            path,
+            force_hantek,
+            self._importer,
+            self._hantek_importer,
+            self._bin_importer,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_import_ready)
+        worker.failed.connect(self._on_import_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_import_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._import_thread = thread
+        self._import_worker = worker
+        thread.start()
+
+    def _on_import_thread_finished(self) -> None:
+        self._import_worker_busy = False
+        self._import_thread = None
+        self._import_worker = None
+        if self._import_pending_args is not None:
+            request_id, path, force_hantek = self._import_pending_args
+            self._import_pending_args = None
+            self.statusBar().showMessage(f"Importando {path.name}…")
+            self._start_import_worker(request_id, path, force_hantek)
+
+    def _on_import_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._import_request_id:
+            return  # una importación más nueva ya reemplazó a esta
+        QMessageBox.critical(self, "No se pudo abrir la adquisición", message)
+        self.statusBar().showMessage("Error de importación")
+
+    def _on_import_ready(self, request_id: int, result: object, path: Path, accepted: int) -> None:
+        if request_id != self._import_request_id:
+            return  # el usuario abrió/soltó otro archivo antes de que este terminara
 
         self.show_x_cursors.blockSignals(True)
         self.show_y_cursors.blockSignals(True)
@@ -2586,27 +2743,11 @@ class MainWindow(QMainWindow):
         visible = self._visible_channel_indices()
         self.cursor_values.setRowCount(len(visible) if x_visible else 0)
         needs_statistics = not self.statistics_panel.isHidden() or self._show_stats_overlay
+        if x_visible:
+            for visible_row, channel_index in enumerate(visible):
+                self._fill_cursor_value_row(visible_row, channel_index, index1, index2)
         if not needs_statistics:
             self.statistics.setRowCount(0)
-            if x_visible:
-                for visible_row, channel_index in enumerate(visible):
-                    channel = acquisition.channels[channel_index]
-                    displayed_samples = self._displayed_samples(channel_index)
-                    display_unit = self._display_unit(channel_index)
-                    value1 = float(displayed_samples[index1])
-                    value2 = float(displayed_samples[index2])
-                    color = CHANNEL_COLORS[channel_index % len(CHANNEL_COLORS)]
-                    self._fill_row(
-                        self.cursor_values,
-                        visible_row,
-                        (
-                            channel.name,
-                            self._format_value(value1, display_unit),
-                            self._format_value(value2, display_unit),
-                            self._format_value(value2 - value1, display_unit),
-                        ),
-                        color,
-                    )
             self._update_cursor_overlay(cursor_results)
             self.stats_overlay.hide()
             if self._cycle_reference is not None:
@@ -2615,32 +2756,130 @@ class MainWindow(QMainWindow):
             self._sync_numeric_cursors()
             self._update_partition_lines()
             return
-        self.statistics.setRowCount(len(visible))
+
+        # El cálculo de estadísticas/pulsos/flancos (calculate_statistics,
+        # calculate_pulse_measurements, calculate_edge_measurements y, con dos
+        # canales visibles, estimate_delay_and_phase) puede tardar segundos en
+        # capturas grandes. open_file() deja este panel abierto por defecto, así
+        # que se despacha a un hilo aparte (_dispatch_statistics) en vez de
+        # bloquear la UI aquí; el resto de la vista (cursores, overlays, líneas
+        # de partición) se actualiza de inmediato, sin esperar ese resultado.
+        channel_specs = [
+            (
+                channel_index,
+                acquisition.time[first:last],
+                self._displayed_samples(channel_index)[first:last],
+            )
+            for channel_index in visible
+        ]
+        phase_specs = None
+        if len(visible) >= 2:
+            phase_specs = (
+                acquisition.time[first:last],
+                self._displayed_samples(visible[0])[first:last],
+                self._displayed_samples(visible[1])[first:last],
+            )
+        # Se limpia de inmediato en vez de dejar la tabla de la carga/selección
+        # anterior a la vista mientras el hilo calcula - el statusBar (puesto en
+        # _start_statistics_worker) es el indicador de que hay un cálculo en curso.
+        self.statistics.setRowCount(0)
+        self._dispatch_statistics(channel_specs, phase_specs)
+
+        self._update_cursor_overlay(cursor_results)
+        if self._cycle_reference is not None:
+            self._update_cycle_overlay()
+        self._position_overlays()
+        self._sync_numeric_cursors()
+        self._update_partition_lines()
+
+    def _fill_cursor_value_row(
+        self, visible_row: int, channel_index: int, index1: int, index2: int
+    ) -> None:
+        acquisition = self._acquisition
+        if acquisition is None:
+            return
+        channel = acquisition.channels[channel_index]
+        displayed_samples = self._displayed_samples(channel_index)
+        display_unit = self._display_unit(channel_index)
+        value1 = float(displayed_samples[index1])
+        value2 = float(displayed_samples[index2])
+        color = CHANNEL_COLORS[channel_index % len(CHANNEL_COLORS)]
+        self._fill_row(
+            self.cursor_values,
+            visible_row,
+            (
+                channel.name,
+                self._format_value(value1, display_unit),
+                self._format_value(value2, display_unit),
+                self._format_value(value2 - value1, display_unit),
+            ),
+            color,
+        )
+
+    def _dispatch_statistics(
+        self,
+        channel_specs: list[tuple[int, np.ndarray, np.ndarray]],
+        phase_specs: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    ) -> None:
+        self._stats_request_id += 1
+        request_id = self._stats_request_id
+        if self._stats_worker_busy:
+            # Un cálculo anterior sigue en curso: no se apilan hilos, solo se
+            # recuerda el pedido más reciente y se descarta cualquier otro que
+            # estuviera pendiente - en cuanto termine el actual se dispara este.
+            self._stats_pending_args = (request_id, channel_specs, phase_specs)
+            return
+        self._start_statistics_worker(request_id, channel_specs, phase_specs)
+
+    def _start_statistics_worker(
+        self,
+        request_id: int,
+        channel_specs: list[tuple[int, np.ndarray, np.ndarray]],
+        phase_specs: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    ) -> None:
+        self._stats_worker_busy = True
+        self.statusBar().showMessage("Calculando estadísticas…")
+        thread = QThread(self)
+        worker = _StatisticsWorker(request_id, channel_specs, phase_specs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_statistics_ready)
+        worker.failed.connect(self._on_statistics_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._on_statistics_thread_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._stats_thread = thread
+        self._stats_worker = worker
+        thread.start()
+
+    def _on_statistics_thread_finished(self) -> None:
+        self._stats_worker_busy = False
+        self._stats_thread = None
+        self._stats_worker = None
+        if self._stats_pending_args is not None:
+            request_id, channel_specs, phase_specs = self._stats_pending_args
+            self._stats_pending_args = None
+            self._start_statistics_worker(request_id, channel_specs, phase_specs)
+
+    def _on_statistics_ready(
+        self,
+        request_id: int,
+        results: list[tuple[int, object, object, object]],
+        phase_result: tuple[float | None, float | None] | None,
+    ) -> None:
+        acquisition = self._acquisition
+        if request_id != self._stats_request_id or acquisition is None:
+            return  # una petición más nueva ya está en curso o se cerró el archivo
+        self.statistics.setRowCount(len(results))
         stats_overlay_rows: list[tuple[str, str, str, str, str, str, str, str]] = []
-        for visible_row, channel_index in enumerate(visible):
+        visible: list[int] = []
+        for row_index, (channel_index, statistics, pulse, edges) in enumerate(results):
+            visible.append(channel_index)
             channel = acquisition.channels[channel_index]
-            displayed_samples = self._displayed_samples(channel_index)
             display_unit = self._display_unit(channel_index)
-            value1 = float(displayed_samples[index1])
-            value2 = float(displayed_samples[index2])
             color = CHANNEL_COLORS[channel_index % len(CHANNEL_COLORS)]
-
-            if x_visible:
-                cursor_values = (
-                    channel.name,
-                    self._format_value(value1, display_unit),
-                    self._format_value(value2, display_unit),
-                    self._format_value(value2 - value1, display_unit),
-                )
-                self._fill_row(self.cursor_values, visible_row, cursor_values, color)
-
-            statistics = calculate_statistics(displayed_samples[first:last])
-            pulse = calculate_pulse_measurements(
-                acquisition.time[first:last], displayed_samples[first:last]
-            )
-            edges = calculate_edge_measurements(
-                acquisition.time[first:last], displayed_samples[first:last]
-            )
             frequency_text = (
                 f"{pulse.frequency:,.6g} Hz" if pulse.frequency is not None else "—"
             )
@@ -2672,7 +2911,7 @@ class MainWindow(QMainWindow):
                 else "—",
                 f"{statistics.count_valid:,}/{statistics.count_total:,}",
             )
-            self._fill_row(self.statistics, visible_row, statistic_values, color)
+            self._fill_row(self.statistics, row_index, statistic_values, color)
             stats_overlay_rows.append(
                 (
                     channel.name,
@@ -2685,14 +2924,9 @@ class MainWindow(QMainWindow):
                     duty_text,
                 )
             )
-        if len(visible) >= 2:
-            first_channel = self._displayed_samples(visible[0])[first:last]
-            second_channel = self._displayed_samples(visible[1])[first:last]
-            scoped_time = acquisition.time[first:last]
-            reference_pulse = calculate_pulse_measurements(scoped_time, first_channel)
-            delay, phase = estimate_delay_and_phase(
-                scoped_time, first_channel, second_channel, reference_pulse.frequency
-            )
+        self._update_stats_overlay(stats_overlay_rows)
+        if phase_result is not None and len(visible) >= 2:
+            delay, phase = phase_result
             delay_text = self._format_time(delay) if delay is not None else "—"
             phase_text = f"{phase:,.3f}°" if phase is not None else "—"
             self.phase_summary.setText(
@@ -2702,13 +2936,22 @@ class MainWindow(QMainWindow):
             )
         else:
             self.phase_summary.setText("Retardo/fase: seleccione al menos dos canales")
-        self._update_cursor_overlay(cursor_results)
-        self._update_stats_overlay(stats_overlay_rows)
-        if self._cycle_reference is not None:
-            self._update_cycle_overlay()
-        self._position_overlays()
-        self._sync_numeric_cursors()
-        self._update_partition_lines()
+        self.statusBar().clearMessage()
+
+    def _on_statistics_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._stats_request_id:
+            return
+        self.statusBar().showMessage(f"No se pudieron calcular las estadísticas: {message}", 5000)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - nombre impuesto por Qt
+        # No se puede interrumpir un cálculo/import a mitad de camino; se
+        # espera a que terminen para no destruir un QThread en marcha (evita
+        # el crash/aviso "QThread destroyed while running").
+        if self._stats_thread is not None:
+            self._stats_thread.wait(5000)
+        if self._import_thread is not None:
+            self._import_thread.wait(5000)
+        super().closeEvent(event)
 
     def _update_cursor_overlay(self, values: tuple[str, ...]) -> None:
         placement_prompts = {

@@ -9,6 +9,7 @@ detectan regresiones al instanciar y operar la ventana.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,21 @@ class _FakeDropEvent:
 
     def mimeData(self) -> QMimeData:
         return self._mime
+
+
+def _open_and_wait(window: MainWindow, qapp, path: Path, *, timeout: float = 5.0, **kwargs) -> None:
+    """Abre un archivo y bombea el event loop hasta que el import en segundo
+    plano (ver ``_dispatch_import``/``_ImportWorker`` en main_window.py) haya
+    terminado de aplicarse. ``open_file`` ya no bloquea - solo encola el
+    trabajo - así que las pruebas deben esperar el resultado explícitamente
+    en vez de asumir que vuelve aplicado de forma síncrona.
+    """
+    window.open_file(path, **kwargs)
+    deadline = time.perf_counter() + timeout
+    while window._import_worker_busy and time.perf_counter() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert not window._import_worker_busy, "la importación en background no terminó a tiempo"
 
 
 @pytest.fixture(scope="module")
@@ -65,8 +81,8 @@ def test_all_panels_hidden_before_any_import(window) -> None:
     assert window.statistics_panel_action.isChecked() is False
 
 
-def test_importing_a_file_shows_all_panels(window, sample_csv) -> None:
-    window.open_file(sample_csv)
+def test_importing_a_file_shows_all_panels(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
 
     assert window.channel_panel.isHidden() is False
     assert window.cursor_panel.isHidden() is False
@@ -76,8 +92,8 @@ def test_importing_a_file_shows_all_panels(window, sample_csv) -> None:
     assert window.statistics_panel_action.isChecked() is True
 
 
-def test_importing_a_file_builds_a_card_per_channel(window, sample_csv) -> None:
-    window.open_file(sample_csv)
+def test_importing_a_file_builds_a_card_per_channel(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
 
     assert len(window.channel_cards) == 4
     for expected_index, card in enumerate(window.channel_cards):
@@ -87,17 +103,18 @@ def test_importing_a_file_builds_a_card_per_channel(window, sample_csv) -> None:
         assert card.offset_control.value() == 0.0
 
 
-def test_channel_card_color_matches_channel_colors(window, sample_csv) -> None:
+def test_channel_card_color_matches_channel_colors(window, qapp, sample_csv) -> None:
     from osc_app.app.main_window import CHANNEL_COLORS
 
-    window.open_file(sample_csv)
+    _open_and_wait(window, qapp, sample_csv)
 
+    assert window.channel_cards, "se esperaba al menos una tarjeta de canal"
     for index, card in enumerate(window.channel_cards):
         assert CHANNEL_COLORS[index % len(CHANNEL_COLORS)] in card.styleSheet()
 
 
-def test_importing_a_file_updates_permanent_status_summary(window, sample_csv) -> None:
-    window.open_file(sample_csv)
+def test_importing_a_file_updates_permanent_status_summary(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
 
     text = window.info.text()
     assert sample_csv.name in text
@@ -106,24 +123,24 @@ def test_importing_a_file_updates_permanent_status_summary(window, sample_csv) -
     assert "en memoria" in text
 
 
-def test_hiding_a_channel_updates_active_count_in_summary(window, sample_csv) -> None:
-    window.open_file(sample_csv)
+def test_hiding_a_channel_updates_active_count_in_summary(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
 
     window._channel_checks[0].setChecked(False)
 
     assert "canales 3/4" in window.info.text()
 
 
-def test_importing_a_file_adds_it_to_recent_files(window, sample_csv) -> None:
+def test_importing_a_file_adds_it_to_recent_files(window, qapp, sample_csv) -> None:
     assert window._load_recent_files() == []
 
-    window.open_file(sample_csv)
+    _open_and_wait(window, qapp, sample_csv)
 
     assert window._load_recent_files() == [str(sample_csv)]
 
 
-def test_recent_files_menu_offers_clear_and_reopen(window, sample_csv) -> None:
-    window.open_file(sample_csv)
+def test_recent_files_menu_offers_clear_and_reopen(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
 
     window._rebuild_recent_files_menu()
     labels = [action.text() for action in window.recent_files_menu.actions()]
