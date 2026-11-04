@@ -121,6 +121,7 @@ o errores de cero.
 | Hantek LWF binario | Experimental | Lectura autónoma; no requiere CSV, REF ni BMP |
 | SIGLENT BIN moderno de 8 bits | Experimental | Validado con cabecera `0x800` |
 | SIGLENT BIN de 16 bits | Pendiente | Se rechaza de forma segura |
+| SIGLENT SLG (registro largo `SPLG`) | Experimental | Validado con SDS1104X-E, 1 canal; multicanal sin verificar |
 | BIN SIGLENT antiguo | Pendiente | Necesita un parser independiente |
 | MATLAB/DAT | Pendiente | Planificado como importador adicional |
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SUPPORTED_ACQUISITION_SUFFIXES = frozenset({".csv", ".bin", ".lwf"})
+SUPPORTED_ACQUISITION_SUFFIXES = frozenset({".csv", ".bin", ".slg", ".lwf"})
 
 
 def is_supported_acquisition_file(path: str | Path) -> bool:

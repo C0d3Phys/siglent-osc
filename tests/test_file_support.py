@@ -8,6 +8,7 @@ def test_accepts_known_extensions_case_insensitively() -> None:
     assert is_supported_acquisition_file(Path("capture.CSV"))
     assert is_supported_acquisition_file(Path("capture.bin"))
     assert is_supported_acquisition_file(Path("capture.LWF"))
+    assert is_supported_acquisition_file(Path("capture.SLG"))
 
 
 def test_rejects_unrelated_extensions() -> None:

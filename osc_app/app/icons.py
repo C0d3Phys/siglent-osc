@@ -152,7 +152,45 @@ def _draw_fft(painter: QPainter, rect: QRectF) -> None:
         painter.drawLine(QPointF(x, base), QPointF(x, top))
 
 
+def _draw_panel(painter: QPainter, rect: QRectF, side: str) -> None:
+    """Ventana con una franja resaltada en el lado indicado (panel lateral)."""
+    painter.drawRoundedRect(rect, 3, 3)
+    if side == "left":
+        x = rect.left() + rect.width() * 0.34
+        painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+    elif side == "right":
+        x = rect.right() - rect.width() * 0.34
+        painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+    else:
+        y = rect.bottom() - rect.height() * 0.34
+        painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+
+
+def _draw_reference(painter: QPainter, rect: QRectF) -> None:
+    """Dos ondas desfasadas (señal actual frente a referencia)."""
+    for offset in (-rect.height() * 0.16, rect.height() * 0.16):
+        path = QPainterPath()
+        mid = rect.center().y() + offset
+        amplitude = rect.height() * 0.16
+        path.moveTo(rect.left(), mid)
+        path.cubicTo(
+            QPointF(rect.left() + rect.width() * 0.25, mid - amplitude * 2),
+            QPointF(rect.left() + rect.width() * 0.25, mid + amplitude * 2),
+            QPointF(rect.center().x(), mid),
+        )
+        path.cubicTo(
+            QPointF(rect.right() - rect.width() * 0.25, mid - amplitude * 2),
+            QPointF(rect.right() - rect.width() * 0.25, mid + amplitude * 2),
+            QPointF(rect.right(), mid),
+        )
+        painter.drawPath(path)
+
+
 _DRAWERS: dict[str, Callable[[QPainter, QRectF], None]] = {
+    "panel_left": lambda painter, rect: _draw_panel(painter, rect, "left"),
+    "panel_right": lambda painter, rect: _draw_panel(painter, rect, "right"),
+    "panel_bottom": lambda painter, rect: _draw_panel(painter, rect, "bottom"),
+    "reference": _draw_reference,
     "open": _draw_open,
     "save_image": _draw_save_image,
     "cursor_x": _draw_cursor_x,
