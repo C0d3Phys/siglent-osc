@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -61,6 +62,7 @@ from osc_app.core.measurements import (
     nearest_index,
 )
 from osc_app.core.models import Acquisition
+from osc_app.core.quantity import format_quantity, parse_quantity
 from osc_app.core.recent_files import MAX_RECENT_FILES, filter_existing_paths, push_recent_file
 from osc_app.core.references import compare_reference, reference_time_shift, transform_reference
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
@@ -403,6 +405,60 @@ class ChannelCard(QFrame):
         self.coupling_control.setToolTip(lock_tip if locked else "Acoplamiento del canal")
 
 
+class CursorField(QLineEdit):
+    """Campo de posición de un cursor con unidades automáticas.
+
+    Muestra el valor con prefijo SI (``-50.0000 ms``) y acepta lo que escriba
+    el usuario en cualquier escala (``12.5 ms``, ``250u``, ``0,3 V``). Un texto
+    no válido se marca en rojo y se restablece el último valor correcto.
+    """
+
+    valueEntered = Signal(float)
+
+    def __init__(self, unit: str, *, digits: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._unit = unit
+        self._digits = digits
+        self._value = 0.0
+        self._update_tooltip()
+        self.editingFinished.connect(self._commit)
+        self.textEdited.connect(lambda _text: self.setStyleSheet(""))
+        self.set_value(0.0)
+
+    def value(self) -> float:
+        return self._value
+
+    def set_unit(self, unit: str) -> None:
+        if unit != self._unit:
+            self._unit = unit
+            self._update_tooltip()
+            self.set_value(self._value)
+
+    def set_value(self, value: float) -> None:
+        self._value = value
+        if not self.hasFocus():
+            self.setText(format_quantity(value, self._unit, self._digits))
+
+    def _update_tooltip(self) -> None:
+        self.setToolTip(
+            f"Escriba un valor con o sin prefijo, p. ej. 12.5 m{self._unit} o 250 µ{self._unit}"
+        )
+
+    def _commit(self) -> None:
+        if not self.isModified():
+            return
+        try:
+            value = parse_quantity(self.text(), self._unit)
+        except ValueError:
+            self.setStyleSheet("border: 1px solid #e5534b;")
+            self.setText(format_quantity(self._value, self._unit, self._digits))
+            return
+        self.setStyleSheet("")
+        self._value = value
+        self.setText(format_quantity(value, self._unit, self._digits))
+        self.valueEntered.emit(value)
+
+
 class DraggableTextItem(pg.TextItem):
     """Texto superpuesto que el usuario puede recolocar dentro de la gráfica."""
 
@@ -596,6 +652,8 @@ class MainWindow(QMainWindow):
         self._channel_inverted: list[bool] = []
         self._coupling_cache: dict[tuple[int, str, float], np.ndarray] = {}
         self._placing_cursor: str | None = None
+        # Pares de cursores ("x"/"y") que esperan a que termine otra colocación.
+        self._placement_queue: list[str] = []
         self._show_cursor_overlay = False
         self._show_stats_overlay = False
         self._pressure_mode_active = False
@@ -962,50 +1020,61 @@ class MainWindow(QMainWindow):
         cursor_switches.addWidget(self.show_x_cursors)
         cursor_switches.addWidget(self.show_y_cursors)
         cursor_layout.addLayout(cursor_switches)
+
+        # Cada bloque reúne la posición editable y sus resultados: X1/X2 se
+        # escriben y leen en el mismo campo, sin una tabla aparte que los repita.
+        self._cursor_readouts: dict[str, QLabel] = {}
+        self._cursor_readout_titles: dict[str, QLabel] = {}
+        self.x_cursor_group = QGroupBox("Tiempo  ·  X1 / X2")
+        x_grid = QGridLayout(self.x_cursor_group)
+        x_grid.setColumnStretch(1, 1)
+        x_grid.setColumnStretch(3, 1)
+        self.x1_numeric = CursorField("s", digits=6)
+        self.x2_numeric = CursorField("s", digits=6)
+        self.x1_numeric.valueEntered.connect(lambda value: self._set_numeric_cursor("x1", value))
+        self.x2_numeric.valueEntered.connect(lambda value: self._set_numeric_cursor("x2", value))
+        x_grid.addWidget(QLabel("X1"), 0, 0)
+        x_grid.addWidget(self.x1_numeric, 0, 1, 1, 3)
+        x_grid.addWidget(QLabel("X2"), 1, 0)
+        x_grid.addWidget(self.x2_numeric, 1, 1, 1, 3)
+        self._add_readout(x_grid, 2, 0, "Δt")
+        self._add_readout(x_grid, 2, 2, "1/Δt")
+        self._add_readout(x_grid, 3, 0, "Muestras", span=3)
+        self._add_readout(x_grid, 4, 0, "Grados", span=3)
         self.snap_x_to_samples = QCheckBox("Ajustar X a la muestra al soltar")
         self.snap_x_to_samples.setChecked(False)
         self.snap_x_to_samples.setToolTip(
             "Si está desactivado, X1 y X2 permanecen exactamente donde se sueltan"
         )
         self.snap_x_to_samples.toggled.connect(self._snap_option_changed)
-        cursor_layout.addWidget(self.snap_x_to_samples)
+        x_grid.addWidget(self.snap_x_to_samples, 5, 0, 1, 4)
         self.lock_x_cursors = QCheckBox("Bloquear separación X1–X2")
         self.lock_x_cursors.toggled.connect(self._lock_x_changed)
-        cursor_layout.addWidget(self.lock_x_cursors)
-
-        numeric_group = QGroupBox("Posición numérica")
-        numeric_layout = QFormLayout(numeric_group)
-        self.x1_numeric = self._cursor_numeric_control()
-        self.x2_numeric = self._cursor_numeric_control()
-        self.y1_numeric = self._cursor_numeric_control()
-        self.y2_numeric = self._cursor_numeric_control()
-        self.x1_numeric.editingFinished.connect(
-            lambda: self._set_numeric_cursor("x1", self.x1_numeric.value())
-        )
-        self.x2_numeric.editingFinished.connect(
-            lambda: self._set_numeric_cursor("x2", self.x2_numeric.value())
-        )
-        self.y1_numeric.editingFinished.connect(
-            lambda: self._set_numeric_cursor("y1", self.y1_numeric.value())
-        )
-        self.y2_numeric.editingFinished.connect(
-            lambda: self._set_numeric_cursor("y2", self.y2_numeric.value())
-        )
-        numeric_layout.addRow("X1 (s):", self.x1_numeric)
-        numeric_layout.addRow("X2 (s):", self.x2_numeric)
-        numeric_layout.addRow("Y1:", self.y1_numeric)
-        numeric_layout.addRow("Y2:", self.y2_numeric)
-        cursor_layout.addWidget(numeric_group)
-
-        partition_row = QHBoxLayout()
-        partition_row.addWidget(QLabel("Particiones X1–X2:"))
+        x_grid.addWidget(self.lock_x_cursors, 6, 0, 1, 4)
         self.partition_count = QSpinBox()
         self.partition_count.setRange(0, 32)
         self.partition_count.setSpecialValueText("Ninguna")
         self.partition_count.setValue(0)
         self.partition_count.valueChanged.connect(self._update_partition_lines)
-        partition_row.addWidget(self.partition_count)
-        cursor_layout.addLayout(partition_row)
+        x_grid.addWidget(QLabel("Particiones"), 7, 0, 1, 2)
+        x_grid.addWidget(self.partition_count, 7, 2, 1, 2)
+        self.x_cursor_group.setEnabled(False)
+        cursor_layout.addWidget(self.x_cursor_group)
+
+        self.y_cursor_group = QGroupBox("Amplitud  ·  Y1 / Y2")
+        y_grid = QGridLayout(self.y_cursor_group)
+        y_grid.setColumnStretch(1, 1)
+        self.y1_numeric = CursorField("V", digits=5)
+        self.y2_numeric = CursorField("V", digits=5)
+        self.y1_numeric.valueEntered.connect(lambda value: self._set_numeric_cursor("y1", value))
+        self.y2_numeric.valueEntered.connect(lambda value: self._set_numeric_cursor("y2", value))
+        y_grid.addWidget(QLabel("Y1"), 0, 0)
+        y_grid.addWidget(self.y1_numeric, 0, 1)
+        y_grid.addWidget(QLabel("Y2"), 1, 0)
+        y_grid.addWidget(self.y2_numeric, 1, 1)
+        self._add_readout(y_grid, 2, 0, "ΔY")
+        self.y_cursor_group.setEnabled(False)
+        cursor_layout.addWidget(self.y_cursor_group)
 
         self.define_cycle_button = QPushButton("Marcar 0° y 720°")
         self.define_cycle_button.setToolTip(
@@ -1028,19 +1097,6 @@ class MainWindow(QMainWindow):
         self.cycle_summary.setWordWrap(True)
         cycle_layout.addWidget(self.cycle_summary)
         cycle_layout.addStretch(1)
-
-        self.cursor_metrics = QTableWidget(len(CURSOR_ROWS), 2)
-        self.cursor_metrics.setHorizontalHeaderLabels(["Medida", "Resultado"])
-        self.cursor_metrics.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.cursor_metrics.verticalHeader().setVisible(False)
-        self.cursor_metrics.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.cursor_metrics.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for row, label in enumerate(CURSOR_ROWS):
-            self.cursor_metrics.setItem(row, 0, QTableWidgetItem(label))
-            self.cursor_metrics.setItem(row, 1, QTableWidgetItem("—"))
-        self.cursor_metrics.verticalHeader().setDefaultSectionSize(23)
-        self.cursor_metrics.setFixedHeight(_table_height(self.cursor_metrics, len(CURSOR_ROWS)))
-        cursor_layout.addWidget(self.cursor_metrics)
 
         values_label = QLabel("Valores por canal")
         values_label.setStyleSheet("font-weight: 600;")
@@ -1068,13 +1124,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(tabs)
         return panel
 
-    @staticmethod
-    def _cursor_numeric_control() -> QDoubleSpinBox:
-        control = QDoubleSpinBox()
-        control.setDecimals(9)
-        control.setRange(-1e12, 1e12)
-        control.setKeyboardTracking(False)
-        return control
+    def _add_readout(
+        self, grid: QGridLayout, row: int, column: int, name: str, *, span: int = 1
+    ) -> None:
+        title = QLabel(name)
+        title.setStyleSheet("color: #b4bcc8;")
+        value = QLabel("—")
+        value.setStyleSheet("font-weight: 600;")
+        value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        grid.addWidget(title, row, column)
+        grid.addWidget(value, row, column + 1, 1, span)
+        self._cursor_readouts[name] = value
+        self._cursor_readout_titles[name] = title
 
     def _build_menu(self) -> None:
         file_menu = self.menuBar().addMenu("&Archivo")
@@ -1707,7 +1768,7 @@ class MainWindow(QMainWindow):
         if (
             acquisition is None
             or not self.use_region.isChecked()
-            or not self.show_x_cursors.isChecked()
+            or not self._x_cursors_ready()
         ):
             return slice(None)
         first, last = inclusive_region_indices(
@@ -2547,9 +2608,7 @@ class MainWindow(QMainWindow):
             (self.y1_numeric, float(self.cursor_y1.value())),
             (self.y2_numeric, float(self.cursor_y2.value())),
         ):
-            control.blockSignals(True)
-            control.setValue(value)
-            control.blockSignals(False)
+            control.set_value(value)
 
     def _update_partition_lines(self, *_args: object) -> None:
         for line in self._partition_lines:
@@ -2582,6 +2641,9 @@ class MainWindow(QMainWindow):
             )
             return
         self._pending_cycle_start = None
+        if self._placing_cursor in ("x1", "x2", "y1", "y2"):
+            # Se retoma después del ciclo, desde el primer cursor del par.
+            self._placement_queue.insert(0, self._placing_cursor[0])
         self._placing_cursor = "cycle0"
         self.statusBar().showMessage("Ciclo motor: haga clic en el punto de 0°")
         self._refresh_measurements()
@@ -2590,7 +2652,7 @@ class MainWindow(QMainWindow):
         self._cycle_reference = None
         self._pending_cycle_start = None
         if self._placing_cursor in ("cycle0", "cycle720"):
-            self._placing_cursor = None
+            self._finish_cursor_placement()
         if hasattr(self, "_phase_regions"):
             for phase_region, phase_label in zip(
                 self._phase_regions, self._phase_labels, strict=True
@@ -2633,6 +2695,7 @@ class MainWindow(QMainWindow):
         self._position_overlays()
         self._refresh_measurements()
         self.statusBar().showMessage("Ciclo 0°–720° definido")
+        self._finish_cursor_placement()
 
     def _cycle_phase_changed(self, *_args: object) -> None:
         if self._cycle_reference is None:
@@ -2730,16 +2793,59 @@ class MainWindow(QMainWindow):
         start, end = self._cycle_reference
         return (time_value - start) * 720.0 / (end - start)
 
+    def _start_cursor_placement(self, kind: str) -> None:
+        """Pide colocar con dos clics el par de cursores ``kind`` ("x" o "y").
+
+        Si ya se está colocando otro par (o el ciclo motor), este espera en la
+        cola en vez de interrumpirlo; antes, activar Y mientras se colocaba X
+        dejaba los cursores X ocultos para siempre.
+        """
+        if self._placing_cursor is not None and self._placing_cursor[0] != kind:
+            if kind not in self._placement_queue:
+                self._placement_queue.append(kind)
+            return
+        label = kind.upper()
+        self._placing_cursor = f"{kind}1"
+        self.statusBar().showMessage(f"Cursores {label}: haga clic para colocar {label}1")
+
+    def _finish_cursor_placement(self) -> None:
+        """Termina la colocación actual y empieza la siguiente que esté en cola."""
+        self._placing_cursor = None
+        while self._placement_queue:
+            kind = self._placement_queue.pop(0)
+            checkbox = self.show_x_cursors if kind == "x" else self.show_y_cursors
+            if checkbox.isChecked():
+                self._start_cursor_placement(kind)
+                self._refresh_measurements()
+                return
+
+    def _x_cursors_ready(self) -> bool:
+        """Los cursores X están activos y ya colocados (no esperando clics)."""
+        return (
+            self.show_x_cursors.isChecked()
+            and self._placing_cursor not in ("x1", "x2")
+            and "x" not in self._placement_queue
+        )
+
+    def _y_cursors_ready(self) -> bool:
+        return (
+            self.show_y_cursors.isChecked()
+            and self._placing_cursor not in ("y1", "y2")
+            and "y" not in self._placement_queue
+        )
+
     def _toggle_x_cursors(self, visible: bool) -> None:
+        self.x_cursor_group.setEnabled(visible)
         if visible and self._acquisition is not None:
-            self._placing_cursor = "x1"
             self.cursor_x1.hide()
             self.cursor_x2.hide()
             self.region.hide()
-            self.statusBar().showMessage("Cursores X: haga clic para colocar X1")
+            self._start_cursor_placement("x")
         else:
+            if "x" in self._placement_queue:
+                self._placement_queue.remove("x")
             if self._placing_cursor in ("x1", "x2"):
-                self._placing_cursor = None
+                self._finish_cursor_placement()
             self.cursor_x1.setVisible(visible)
             self.cursor_x2.setVisible(visible)
             self.region.setVisible(visible)
@@ -2748,6 +2854,7 @@ class MainWindow(QMainWindow):
         self._refresh_measurements()
 
     def _toggle_y_cursors(self, visible: bool) -> None:
+        self.y_cursor_group.setEnabled(visible)
         if visible:
             low, high = self.plot.getViewBox().viewRange()[1]
             y1 = float(self.cursor_y1.value())
@@ -2757,13 +2864,14 @@ class MainWindow(QMainWindow):
                 self.cursor_y1.setValue(low + span * 0.35)
                 self.cursor_y2.setValue(low + span * 0.65)
             if self._acquisition is not None:
-                self._placing_cursor = "y1"
                 self.cursor_y1.hide()
                 self.cursor_y2.hide()
-                self.statusBar().showMessage("Cursores Y: haga clic para colocar Y1")
+                self._start_cursor_placement("y")
         else:
+            if "y" in self._placement_queue:
+                self._placement_queue.remove("y")
             if self._placing_cursor in ("y1", "y2"):
-                self._placing_cursor = None
+                self._finish_cursor_placement()
             self.cursor_y1.setVisible(False)
             self.cursor_y2.setVisible(False)
         self.cursor_overlay.setVisible(self._show_cursor_overlay and self._any_cursor_visible())
@@ -2795,6 +2903,7 @@ class MainWindow(QMainWindow):
             self._placing_cursor = None
             self._x_cursor_finished()
             self.statusBar().showMessage("Cursores X colocados; puede arrastrarlos")
+            self._finish_cursor_placement()
             return
         if self._placing_cursor == "y1":
             self.cursor_y1.setValue(y_value)
@@ -2809,6 +2918,7 @@ class MainWindow(QMainWindow):
             self._placing_cursor = None
             self._refresh_measurements()
             self.statusBar().showMessage("Cursores Y colocados; puede arrastrarlos")
+            self._finish_cursor_placement()
 
     def _refresh_measurements(self) -> None:
         acquisition = self._acquisition
@@ -2825,13 +2935,14 @@ class MainWindow(QMainWindow):
         delta_degrees = abs(degrees2 - degrees1) if None not in (degrees1, degrees2) else None
         first, last = inclusive_region_indices(acquisition.time, time1, time2)
 
-        x_visible = self.show_x_cursors.isChecked()
+        x_visible = self._x_cursors_ready()
+        y_visible = self._y_cursors_ready()
         vertical_unit = "PSI" if self._pressure_mode_active else "V"
         cursor_results = (
             self._format_time(time1) if x_visible else "—",
             self._format_time(time2) if x_visible else "—",
             self._format_time(delta_time) if x_visible else "—",
-            f"{frequency:,.6g} Hz" if frequency is not None and x_visible else "—",
+            self._format_value(frequency, "Hz") if frequency is not None and x_visible else "—",
             f"{degrees1:,.3f}°" if degrees1 is not None and x_visible else "—",
             f"{degrees2:,.3f}°" if degrees2 is not None and x_visible else "—",
             f"{delta_degrees:,.3f}°" if delta_degrees is not None and x_visible else "—",
@@ -2839,20 +2950,19 @@ class MainWindow(QMainWindow):
             f"{index2:,}" if x_visible else "—",
             f"{last - first:,}" if x_visible else "—",
             self._format_value(float(self.cursor_y1.value()), vertical_unit)
-            if self.show_y_cursors.isChecked()
+            if y_visible
             else "—",
             self._format_value(float(self.cursor_y2.value()), vertical_unit)
-            if self.show_y_cursors.isChecked()
+            if y_visible
             else "—",
             self._format_value(
                 abs(float(self.cursor_y2.value()) - float(self.cursor_y1.value())),
                 vertical_unit,
             )
-            if self.show_y_cursors.isChecked()
+            if y_visible
             else "—",
         )
-        for row, value in enumerate(cursor_results):
-            self.cursor_metrics.setItem(row, 1, QTableWidgetItem(value))
+        self._show_cursor_readouts(cursor_results, vertical_unit)
 
         if not self.use_region.isChecked() or not x_visible:
             first, last = 0, acquisition.sample_count
@@ -2908,6 +3018,27 @@ class MainWindow(QMainWindow):
         self._position_overlays()
         self._sync_numeric_cursors()
         self._update_partition_lines()
+
+    def _show_cursor_readouts(self, values: tuple[str, ...], vertical_unit: str) -> None:
+        """Vuelca los resultados (en el orden de ``CURSOR_ROWS``) en la pestaña."""
+        by_name = dict(zip(CURSOR_ROWS, values, strict=True))
+        readouts = self._cursor_readouts
+        readouts["Δt"].setText(by_name["Δt"])
+        readouts["1/Δt"].setText(by_name["1/Δt"])
+        readouts["Muestras"].setText(
+            "—"
+            if by_name["Muestras"] == "—"
+            else f"{by_name['Muestras']}   (índices {by_name['Índice X1']} – {by_name['Índice X2']})"
+        )
+        readouts["Grados"].setText(
+            f"X1 {by_name['X1 (grados)']} · X2 {by_name['X2 (grados)']} · Δ {by_name['Δ grados']}"
+        )
+        has_cycle = self._cycle_reference is not None
+        readouts["Grados"].setVisible(has_cycle)
+        self._cursor_readout_titles["Grados"].setVisible(has_cycle)
+        readouts["ΔY"].setText(by_name["ΔY"])
+        self.y1_numeric.set_unit(vertical_unit)
+        self.y2_numeric.set_unit(vertical_unit)
 
     def _fill_cursor_value_row(
         self, visible_row: int, channel_index: int, index1: int, index2: int
@@ -3087,13 +3218,13 @@ class MainWindow(QMainWindow):
             )
         else:
             rows: list[tuple[str, str]] = []
-            if self.show_x_cursors.isChecked():
+            if self._x_cursors_ready():
                 rows.extend(zip(("X1", "X2", "Δt", "1/Δt"), values[:4], strict=True))
                 if self._cycle_reference is not None:
                     rows.extend(
                         zip(("X1°", "X2°", "Δ°"), values[4:7], strict=True)
                     )
-            if self.show_y_cursors.isChecked():
+            if self._y_cursors_ready():
                 rows.extend(zip(("Y1", "Y2", "ΔY"), values[10:13], strict=True))
             body = "".join(
                 f"<tr><td style='padding-right:10px'>{label}</td><td><b>{value}</b></td></tr>"
@@ -3170,18 +3301,11 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _format_value(value: float, unit: str) -> str:
-        return f"{value:.6g} {unit}" if np.isfinite(value) else "—"
+        return format_quantity(value, unit, 4)
 
     @staticmethod
     def _format_time(value: float) -> str:
-        absolute = abs(value)
-        if absolute < 1e-6:
-            return f"{value * 1e9:.6g} ns"
-        if absolute < 1e-3:
-            return f"{value * 1e6:.6g} µs"
-        if absolute < 0.9995:
-            return f"{value * 1e3:.6g} ms"
-        return f"{value:.6g} s"
+        return format_quantity(value, "s", 5)
 
     def _show_full_view(self) -> None:
         if self._acquisition is None:

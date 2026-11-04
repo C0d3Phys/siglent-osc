@@ -6,6 +6,12 @@ estable.
 
 ## [Sin publicar]
 
+### Corregido
+
+- Activar los cursores X y luego los Y antes de colocarlos dejaba los X ocultos; ahora se
+  colocan ambos pares en orden. Mientras un par no está colocado, sus resultados muestran
+  `—` en vez de valores de posiciones antiguas.
+
 ### Agregado
 
 - Barra de herramientas con íconos y tooltips para las acciones más usadas (abrir, guardar
@@ -25,6 +31,11 @@ estable.
 
 ### Cambiado
 
+- Pestaña Cursores reorganizada en bloques Tiempo (X1/X2) y Amplitud (Y1/Y2): cada posición
+  se escribe y se lee en el mismo campo, con unidades automáticas (`12.5 ms`, `250 µs`), y
+  cabe sin desplazarse. Las filas de grados solo aparecen con ciclo motor definido.
+- Tiempos y voltajes se muestran con prefijo SI y cuatro cifras significativas en tablas y
+  resultados (`3.229 V`, `-114.7 mV`).
 - Panel de canales rediseñado: cada tarjeta muestra la sonda con botones 1X/10X/100X, el
   acoplamiento (DC/AC) y la inversión de polaridad; los campos ya no recortan la unidad.
   El compresímetro pasó a una pestaña del panel de Herramientas.

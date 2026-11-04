@@ -241,3 +241,55 @@ def test_pressure_settings_open_in_tools_panel(window) -> None:
 
     assert window.cursor_panel.isHidden() is False
     assert window.tools_tabs.currentWidget() is window.pressure_tab
+
+
+def test_enabling_x_then_y_places_both_cursor_pairs(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window.toggle_x_cursors_action.setChecked(True)
+    window.toggle_y_cursors_action.setChecked(True)
+
+    assert window._placing_cursor == "x1"
+    for x_value in (0.001, 0.002):
+        window._place_requested_cursor(x_value, 0.0)
+    assert window._placing_cursor == "y1"
+    for y_value in (0.5, 1.5):
+        window._place_requested_cursor(0.0, y_value)
+
+    assert window._placing_cursor is None
+    assert window.cursor_x1.isVisible() and window.cursor_x2.isVisible()
+    assert window.cursor_y1.isVisible() and window.cursor_y2.isVisible()
+    assert window._cursor_readouts["ΔY"].text() == "1.000 V"
+
+
+def test_cursor_results_stay_empty_until_cursors_are_placed(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window.toggle_x_cursors_action.setChecked(True)
+
+    assert window._cursor_readouts["Δt"].text() == "—"
+    assert window.cursor_values.rowCount() == 0
+
+    window._place_requested_cursor(0.001, 0.0)
+    window._place_requested_cursor(0.003, 0.0)
+
+    assert window._cursor_readouts["Δt"].text() == "2.0000 ms"
+    assert window.cursor_values.rowCount() == 4
+
+
+def test_cursor_field_accepts_values_with_si_prefix(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window.toggle_x_cursors_action.setChecked(True)
+    window._place_requested_cursor(0.001, 0.0)
+    window._place_requested_cursor(0.003, 0.0)
+
+    window.x2_numeric.setText("2.5 ms")
+    window.x2_numeric.setModified(True)
+    window.x2_numeric.editingFinished.emit()
+
+    assert float(window.cursor_x2.value()) == pytest.approx(0.0025)
+    assert window.x2_numeric.text() == "2.50000 ms"
+
+    window.x2_numeric.setText("abc")
+    window.x2_numeric.setModified(True)
+    window.x2_numeric.editingFinished.emit()
+    assert float(window.cursor_x2.value()) == pytest.approx(0.0025)
+    assert window.x2_numeric.text() == "2.50000 ms"
