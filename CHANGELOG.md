@@ -25,14 +25,17 @@ estable.
 
 ### Cambiado
 
-- Los tres paneles (Canales, Herramientas, Estadísticas) ahora se muestran automáticamente
-  al importar una adquisición.
+- Panel de canales rediseñado: cada tarjeta muestra la sonda con botones 1X/10X/100X, el
+  acoplamiento (DC/AC) y la inversión de polaridad; los campos ya no recortan la unidad.
+  El compresímetro pasó a una pestaña del panel de Herramientas.
+- Al importar una adquisición los paneles (Canales, Herramientas, Estadísticas) ya no se
+  abren solos; conservan el estado en que el usuario los dejó.
 - El resumen bajo la gráfica pasó de mostrar solo el total de canales a mostrar
   canales activos sobre el total, y añadió la memoria estimada de las muestras crudas.
 - Los íconos de la barra de herramientas dejaron de usar los íconos nativos del sistema
   operativo (inconsistentes y anticuados) y ahora son un set propio de íconos planos
   dibujados por código, que se adaptan al color de texto del tema activo.
-- La barra de herramientas ahora se puede ocultar desde `Opciones → Barra de herramientas`
+- La barra de herramientas ahora se puede ocultar desde `Ver → Barra de herramientas`
   o con clic derecho sobre ella.
 - El panel de canales pasó de una tabla de 5 columnas a una tarjeta por canal (borde del
   color del canal, sonda y offset en la misma fila), eliminando el desbordamiento horizontal

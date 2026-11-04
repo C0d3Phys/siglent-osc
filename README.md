@@ -54,10 +54,10 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 
 - Barra de herramientas con íconos planos dibujados por código (no íconos nativos del
   sistema) y tooltips, para abrir, guardar imagen, cursores X/Y, Auto Y, zoom a región,
-  vista completa, canal matemático y FFT. Se puede ocultar desde `Opciones → Barra de
+  vista completa, canal matemático y FFT. Se puede ocultar desde `Ver → Barra de
   herramientas` o haciendo clic derecho sobre ella.
-- Los tres paneles (Canales, Herramientas, Estadísticas) se muestran automáticamente al
-  importar una adquisición.
+- Los paneles (Canales, Herramientas, Estadísticas) no se abren solos al importar: la gráfica
+  ocupa toda la ventana y cada panel se muestra desde la barra superior o con `Ctrl+1/2/3`.
 - El panel de canales usa una tarjeta por canal, con un borde del color del trazo, casilla
   de visibilidad, botón `Solo`, y los controles de Sonda y Offset en la misma fila.
 - Arrastrar y soltar un archivo `.csv`, `.bin` o `.lwf` sobre la ventana lo abre directamente.

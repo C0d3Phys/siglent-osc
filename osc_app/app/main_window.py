@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -249,11 +251,20 @@ class ChannelOffsetTag(QLabel):
 
 
 class ChannelCard(QFrame):
-    """Tarjeta compacta de un canal: identificada por color, con sonda y offset
+    """Tarjeta de un canal identificada por su color.
 
-    en la misma fila. Reemplaza a las filas de una tabla, que se veían
-    apretadas y forzaban a los controles a envolverse en un espacio angosto.
+    Reúne en un solo lugar lo que se ajusta por canal: visibilidad, polaridad,
+    sonda (con valores comunes a un clic), acoplamiento y offset visual. Cada
+    control usa una fila completa del panel para que el valor y su unidad se
+    lean sin recortes.
     """
+
+    PROBE_PRESETS = (1.0, 10.0, 100.0)
+    COUPLING_LABELS = {
+        "dc": "DC",
+        "ac_mean": "AC (quitar media)",
+        "ac_filter": f"AC (pasa-altos {AC_FILTER_CUTOFF_HZ:g} Hz)",
+    }
 
     def __init__(
         self,
@@ -266,6 +277,8 @@ class ChannelCard(QFrame):
         probe_changed,
         offset_changed,
         solo_requested,
+        coupling_changed,
+        inversion_changed,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -277,13 +290,16 @@ class ChannelCard(QFrame):
             "  background-color: rgba(255, 255, 255, 16);"
             "  border-radius: 6px;"
             "}"
+            "#channelCard QLabel[role='field'] { color: #b4bcc8; }"
         )
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(3)
+        grid = QGridLayout(self)
+        grid.setContentsMargins(8, 6, 8, 8)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
 
         header = QHBoxLayout()
-        header.setSpacing(4)
+        header.setSpacing(6)
         self.visibility_checkbox = QCheckBox()
         self.visibility_checkbox.setChecked(True)
         self.visibility_checkbox.setToolTip(f"Mostrar u ocultar {name}")
@@ -291,47 +307,100 @@ class ChannelCard(QFrame):
             lambda checked: visibility_changed(index, checked)
         )
         header.addWidget(self.visibility_checkbox)
-        self.name_label = QLabel(f"{name}  [{unit}]  [DC]")
-        self.name_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.name_label = QLabel(f"{name}  ·  {unit}")
+        self.name_label.setStyleSheet(f"color: {color}; font-weight: 700; font-size: 10.5pt;")
         header.addWidget(self.name_label, 1)
-        solo_button = QPushButton("Solo")
-        solo_button.setFixedWidth(40)
+        self.invert_button = QToolButton()
+        self.invert_button.setText("Invertir")
+        self.invert_button.setCheckable(True)
+        self.invert_button.setToolTip(f"Invertir la polaridad de {name}")
+        self.invert_button.toggled.connect(lambda checked: inversion_changed(index, checked))
+        header.addWidget(self.invert_button)
+        solo_button = QToolButton()
+        solo_button.setText("Solo")
         solo_button.setToolTip(f"Mostrar únicamente {name}")
         solo_button.clicked.connect(lambda: solo_requested(index))
         header.addWidget(solo_button)
-        outer.addLayout(header)
+        grid.addLayout(header, 0, 0, 1, 2)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(4)
-        probe_label = QLabel("Sonda")
-        probe_label.setStyleSheet("color: #9aa4b2;")
-        controls.addWidget(probe_label)
         self.probe_control = QDoubleSpinBox()
         self.probe_control.setDecimals(2)
         self.probe_control.setRange(0.01, 1000.0)
         self.probe_control.setSingleStep(1.0)
-        self.probe_control.setSuffix("X")
-        self.probe_control.setMaximumWidth(66)
+        self.probe_control.setSuffix(" X")
         self.probe_control.setToolTip(
             "Factor de atenuación de la sonda. Ajusta voltajes, gráfica y mediciones."
         )
         self.probe_control.valueChanged.connect(lambda value: probe_changed(index, value))
-        controls.addWidget(self.probe_control)
-        offset_label = QLabel("Offset")
-        offset_label.setStyleSheet("color: #9aa4b2;")
-        controls.addWidget(offset_label)
+        probe_row = QHBoxLayout()
+        probe_row.setSpacing(4)
+        probe_row.addWidget(self.probe_control, 1)
+        self._probe_preset_buttons: dict[float, QToolButton] = {}
+        for preset in self.PROBE_PRESETS:
+            preset_button = QToolButton()
+            preset_button.setText(f"{preset:g}X")
+            preset_button.setToolTip(f"Sonda {preset:g}X")
+            preset_button.setCheckable(True)
+            preset_button.clicked.connect(
+                lambda _checked=False, value=preset: self._select_probe_preset(value)
+            )
+            probe_row.addWidget(preset_button)
+            self._probe_preset_buttons[preset] = preset_button
+        self.probe_control.valueChanged.connect(self._mark_probe_preset)
+        self._mark_probe_preset(self.probe_control.value())
+        grid.addWidget(self._field_label("Sonda"), 1, 0)
+        grid.addLayout(probe_row, 1, 1)
+
+        self.coupling_control = QComboBox()
+        for mode, _label in COUPLING_MODES:
+            self.coupling_control.addItem(self.COUPLING_LABELS[mode], mode)
+        self.coupling_control.setToolTip("Acoplamiento del canal")
+        self.coupling_control.activated.connect(
+            lambda _row: coupling_changed(index, str(self.coupling_control.currentData()))
+        )
+        grid.addWidget(self._field_label("Acopl."), 2, 0)
+        grid.addWidget(self.coupling_control, 2, 1)
+
         self.offset_control = QDoubleSpinBox()
         self.offset_control.setDecimals(3)
         self.offset_control.setRange(-1e9, 1e9)
         self.offset_control.setKeyboardTracking(False)
         self.offset_control.setSuffix(f" {unit}")
-        self.offset_control.setMaximumWidth(90)
         self.offset_control.setToolTip(
             "Desplazamiento exclusivamente visual; no cambia mediciones ni muestras"
         )
         self.offset_control.valueChanged.connect(lambda value: offset_changed(index, value))
-        controls.addWidget(self.offset_control, 1)
-        outer.addLayout(controls)
+        grid.addWidget(self._field_label("Offset"), 3, 0)
+        grid.addWidget(self.offset_control, 3, 1)
+
+    def _select_probe_preset(self, value: float) -> None:
+        self.probe_control.setValue(value)
+        self._mark_probe_preset(self.probe_control.value())  # por si el valor no cambió
+
+    def _mark_probe_preset(self, value: float) -> None:
+        for preset, button in self._probe_preset_buttons.items():
+            button.setChecked(abs(value - preset) < 1e-9)
+
+    @staticmethod
+    def _field_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setProperty("role", "field")
+        return label
+
+    def set_signal_state(self, unit: str, mode: str, inverted: bool, locked: bool) -> None:
+        """Refleja el estado actual del canal sin volver a emitir cambios."""
+        name = self.name_label.text().split("  ·  ", 1)[0]
+        self.name_label.setText(f"{name}  ·  {unit}")
+        self.coupling_control.blockSignals(True)
+        self.coupling_control.setCurrentIndex(max(self.coupling_control.findData(mode), 0))
+        self.coupling_control.blockSignals(False)
+        self.invert_button.blockSignals(True)
+        self.invert_button.setChecked(inverted)
+        self.invert_button.blockSignals(False)
+        lock_tip = "Bloqueado: el compresímetro requiere DC y polaridad normal"
+        self.coupling_control.setEnabled(not locked)
+        self.invert_button.setEnabled(not locked)
+        self.coupling_control.setToolTip(lock_tip if locked else "Acoplamiento del canal")
 
 
 class DraggableTextItem(pg.TextItem):
@@ -392,8 +461,7 @@ class CtrlDraggableReferenceItem(pg.PlotDataItem):
 class _StatisticsWorker(QObject):
     """Calcula estadísticas, pulsos y flancos por canal fuera del hilo de la UI.
 
-    ``open_file()`` deja los tres paneles visibles al importar (incluido el de
-    Estadísticas), así que este cálculo -antes síncrono sobre la adquisición
+    Con el panel de Estadísticas visible, este cálculo -antes síncrono sobre la adquisición
     completa en ``_refresh_measurements``- corría en el hilo de Qt y congelaba
     la interfaz con capturas grandes (muchas muestras y/o muchos cruces de
     flanco). Se ejecuta aquí en un QThread aparte; el resultado se aplica en
@@ -803,6 +871,15 @@ class MainWindow(QMainWindow):
         panel = QGroupBox("Canales")
         layout = QVBoxLayout(panel)
 
+        show_all = QPushButton("Mostrar todos")
+        show_all.clicked.connect(self._show_all_channels)
+        hide_all = QPushButton("Ocultar todos")
+        hide_all.clicked.connect(self._hide_all_channels)
+        buttons = QHBoxLayout()
+        buttons.addWidget(show_all)
+        buttons.addWidget(hide_all)
+        layout.addLayout(buttons)
+
         self.channel_cards: list[ChannelCard] = []
         self._channel_cards_container = QWidget()
         self._channel_cards_layout = QVBoxLayout(self._channel_cards_container)
@@ -816,22 +893,14 @@ class MainWindow(QMainWindow):
         channel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         channel_scroll.setWidget(self._channel_cards_container)
         layout.addWidget(channel_scroll, 1)
+        # Las tarjetas no se pueden desplazar en horizontal: sin este mínimo, el
+        # splitter recorta los botones 1X/10X/100X al abrir también Herramientas.
+        panel.setMinimumWidth(320)
+        return panel
 
-        show_all = QPushButton("Mostrar todos")
-        show_all.clicked.connect(self._show_all_channels)
-        hide_all = QPushButton("Ocultar todos")
-        hide_all.clicked.connect(self._hide_all_channels)
-        buttons = QHBoxLayout()
-        buttons.addWidget(show_all)
-        buttons.addWidget(hide_all)
-        layout.addLayout(buttons)
-
-        self.pressure_group = QGroupBox("Compresímetro (avanzado)")
-        self.pressure_group.setCheckable(True)
-        self.pressure_group.setChecked(False)
-        pressure_outer_layout = QVBoxLayout(self.pressure_group)
-        self.pressure_content = QWidget()
-        pressure_layout = QFormLayout(self.pressure_content)
+    def _build_pressure_tab(self) -> QWidget:
+        tab = QWidget()
+        pressure_layout = QFormLayout(tab)
         self.pressure_enabled = QCheckBox("Mostrar y medir en PSI")
         self.pressure_channel = QComboBox()
         self.pressure_voltage_min = self._pressure_spin(-1000.0, 1000.0, 0.0, " V")
@@ -850,9 +919,6 @@ class MainWindow(QMainWindow):
         self.pressure_calibration = QLabel("Ganancia: 100 PSI/V")
         self.pressure_calibration.setWordWrap(True)
         pressure_layout.addRow(self.pressure_calibration)
-        pressure_outer_layout.addWidget(self.pressure_content)
-        self.pressure_content.hide()
-        self.pressure_group.toggled.connect(self.pressure_content.setVisible)
         self.pressure_enabled.toggled.connect(self._apply_pressure_configuration)
         self.pressure_channel.currentIndexChanged.connect(self._apply_pressure_configuration)
         for control in (
@@ -863,8 +929,7 @@ class MainWindow(QMainWindow):
             self.pressure_gain,
         ):
             control.valueChanged.connect(self._apply_pressure_configuration)
-        layout.addWidget(self.pressure_group)
-        return panel
+        return tab
 
     @staticmethod
     def _pressure_spin(
@@ -881,6 +946,7 @@ class MainWindow(QMainWindow):
         panel = QGroupBox("Herramientas")
         layout = QVBoxLayout(panel)
         tabs = QTabWidget()
+        self.tools_tabs = tabs
         cursor_tab = QWidget()
         cursor_layout = QVBoxLayout(cursor_tab)
         cycle_tab = QWidget()
@@ -997,6 +1063,8 @@ class MainWindow(QMainWindow):
         cursor_scroll.setWidget(cursor_tab)
         tabs.addTab(cursor_scroll, "Cursores")
         tabs.addTab(cycle_tab, "Ciclo motor")
+        self.pressure_tab = self._build_pressure_tab()
+        tabs.addTab(self.pressure_tab, "Compresímetro")
         layout.addWidget(tabs)
         return panel
 
@@ -1152,8 +1220,8 @@ class MainWindow(QMainWindow):
         analysis_menu.addAction("Pruebas automotrices guiadas…", self._show_guided_tests)
 
     def _show_pressure_settings(self) -> None:
-        self._set_channel_panel_visible(True)
-        self.pressure_group.setChecked(True)
+        self._set_cursor_panel_visible(True)
+        self.tools_tabs.setCurrentWidget(self.pressure_tab)
 
     def _build_toolbar(self) -> None:
         """Barra de herramientas con las acciones más usadas.
@@ -1864,9 +1932,6 @@ class MainWindow(QMainWindow):
         self._initialize_selection()
         self._current_file_name = path.name
         self._remember_recent_file(path)
-        self._set_channel_panel_visible(True)
-        self._set_cursor_panel_visible(True)
-        self._set_statistics_panel_visible(True)
         self._refresh_status_summary()
         self.statusBar().showMessage(
             f"Importación completa: {accepted:,} muestras por canal"
@@ -1966,6 +2031,8 @@ class MainWindow(QMainWindow):
                 probe_changed=self._set_probe_factor,
                 offset_changed=self._set_channel_display_offset,
                 solo_requested=self._solo_channel,
+                coupling_changed=self._card_coupling_changed,
+                inversion_changed=self._card_inversion_changed,
             )
             card.probe_control.setValue(native_probe)
             self._channel_cards_layout.insertWidget(row, card)
@@ -1973,6 +2040,14 @@ class MainWindow(QMainWindow):
             self._channel_checks.append(card.visibility_checkbox)
             self._probe_controls.append(card.probe_control)
             self._offset_controls.append(card.offset_control)
+
+    def _card_coupling_changed(self, index: int, mode: str) -> None:
+        self._set_coupling_mode(index, mode)
+        self._update_channel_label(index)  # revierte la tarjeta si el cambio fue rechazado
+
+    def _card_inversion_changed(self, index: int, inverted: bool) -> None:
+        self._set_channel_inverted(index, inverted)
+        self._update_channel_label(index)
 
     def _clear_channel_cards(self) -> None:
         for card in self.channel_cards:
@@ -2272,16 +2347,12 @@ class MainWindow(QMainWindow):
         acquisition = self._acquisition
         if acquisition is None or not 0 <= index < len(acquisition.channels):
             return
-        channel = acquisition.channels[index]
         unit = self._display_unit(index)
-        coupling = "DC"
-        if index < len(self._coupling_modes):
-            coupling = dict(COUPLING_MODES)[self._coupling_modes[index]].split(" —", 1)[0]
-        polarity = "  [INV]" if index < len(self._channel_inverted) and self._channel_inverted[index] else ""
+        inverted = index < len(self._channel_inverted) and self._channel_inverted[index]
+        mode = self._coupling_modes[index] if index < len(self._coupling_modes) else "dc"
+        locked = self._pressure_mode_active and index == self.pressure_channel.currentIndex()
         if index < len(self.channel_cards):
-            self.channel_cards[index].name_label.setText(
-                f"{channel.name}  [{unit}]  [{coupling}]{polarity}"
-            )
+            self.channel_cards[index].set_signal_state(unit, mode, inverted, locked)
 
     def _display_unit(self, index: int) -> str:
         acquisition = self._acquisition

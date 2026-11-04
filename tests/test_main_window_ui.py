@@ -1,7 +1,7 @@
 """Pruebas de humo de la interfaz principal en modo Qt sin pantalla (offscreen).
 
 Cubren el comportamiento nuevo: barra de herramientas (con la opción de
-ocultarla), los tres paneles abriéndose al importar, las tarjetas por canal,
+ocultarla), los paneles ocultos al importar, las tarjetas por canal,
 el resumen de estado permanente, los archivos recientes y el filtrado de
 arrastrar-y-soltar. No sustituyen pruebas manuales de la interfaz, pero
 detectan regresiones al instanciar y operar la ventana.
@@ -17,7 +17,7 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QMimeData, QSettings, Qt, QUrl
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QToolButton
 
 from osc_app.app.main_window import MainWindow
 from osc_app.tools.generate_sample_csv import generate_sample_csv
@@ -81,15 +81,24 @@ def test_all_panels_hidden_before_any_import(window) -> None:
     assert window.statistics_panel_action.isChecked() is False
 
 
-def test_importing_a_file_shows_all_panels(window, qapp, sample_csv) -> None:
+def test_importing_a_file_keeps_panels_hidden(window, qapp, sample_csv) -> None:
     _open_and_wait(window, qapp, sample_csv)
 
-    assert window.channel_panel.isHidden() is False
+    assert window.channel_panel.isHidden()
+    assert window.cursor_panel.isHidden()
+    assert window.statistics_panel.isHidden()
+    assert window.channel_panel_action.isChecked() is False
+    assert window.cursor_panel_action.isChecked() is False
+    assert window.statistics_panel_action.isChecked() is False
+
+
+def test_importing_a_file_keeps_panels_the_user_opened(window, qapp, sample_csv) -> None:
+    window.cursor_panel_action.setChecked(True)
+    _open_and_wait(window, qapp, sample_csv)
+
     assert window.cursor_panel.isHidden() is False
-    assert window.statistics_panel.isHidden() is False
-    assert window.channel_panel_action.isChecked() is True
-    assert window.cursor_panel_action.isChecked() is True
-    assert window.statistics_panel_action.isChecked() is True
+    assert window.channel_panel.isHidden()
+    assert window.statistics_panel.isHidden()
 
 
 def test_importing_a_file_builds_a_card_per_channel(window, qapp, sample_csv) -> None:
@@ -200,3 +209,35 @@ def test_draw_style_switches_between_vectors_and_dots(window, qapp, sample_csv) 
     window.draw_style.setCurrentIndex(window.draw_style.findData("vectors"))
     assert item.opts["symbol"] is None
     assert item.opts["pen"].color() == line_color
+
+
+def test_channel_card_changes_coupling_and_polarity(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    card = window.channel_cards[1]
+
+    card.coupling_control.setCurrentIndex(card.coupling_control.findData("ac_mean"))
+    card.coupling_control.activated.emit(card.coupling_control.currentIndex())
+    assert window._coupling_modes[1] == "ac_mean"
+
+    card.invert_button.setChecked(True)
+    assert window._channel_inverted[1] is True
+
+
+def test_channel_card_probe_presets_set_the_factor(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    card = window.channel_cards[0]
+    preset = next(
+        button for button in card.findChildren(QToolButton) if button.text() == "10X"
+    )
+
+    preset.click()
+
+    assert card.probe_control.value() == 10.0
+    assert window._applied_probe_factors[0] == 10.0
+
+
+def test_pressure_settings_open_in_tools_panel(window) -> None:
+    window._show_pressure_settings()
+
+    assert window.cursor_panel.isHidden() is False
+    assert window.tools_tabs.currentWidget() is window.pressure_tab
