@@ -410,3 +410,84 @@ def test_open_button_offers_recent_files(window) -> None:
 
     assert open_button.menu() is window.recent_files_menu
     assert window.save_image_action.iconText() == "Guardar imagen"
+
+
+def _menu_texts(menu) -> list[str]:
+    return [action.text() for action in menu.actions() if not action.isSeparator()]
+
+
+def test_zoom_to_region_requires_placed_x_cursors(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    before = window.view_box.viewRange()[0]
+
+    assert window.zoom_region_action.isEnabled() is False
+    window._zoom_to_region()
+    assert window.view_box.viewRange()[0] == before
+
+    window._place_cursor_here("x1", 0.001)
+    assert window.zoom_region_action.isEnabled() is True
+
+
+def test_context_menu_without_acquisition_only_offers_open(window) -> None:
+    menu = window._build_plot_context_menu((0.0, 0.0))
+
+    assert [action for action in menu.actions() if not action.isSeparator()] == [
+        window.open_action
+    ]
+
+
+def test_context_menu_shows_point_values_and_placement_actions(
+    window, qapp, sample_csv
+) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+
+    texts = _menu_texts(window._build_plot_context_menu((0.002, 1.0)))
+
+    assert texts[0].startswith("t = ") and "CH1" in texts[0]
+    assert "Colocar X1 aquí" in texts and "Colocar X2 aquí" in texts
+    assert "Colocar Y1 aquí" not in texts  # cursores Y apagados
+    assert window.zoom_region_action.text() in texts
+    assert "Cancelar colocación" not in texts
+
+
+def test_place_cursor_here_turns_on_cursors_and_keeps_both_visible(
+    window, qapp, sample_csv
+) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+
+    window._place_cursor_here("x2", 0.003)
+
+    assert window.show_x_cursors.isChecked()
+    assert window._placing_cursor is None
+    assert float(window.cursor_x2.value()) == pytest.approx(0.003)
+    low, high = window.view_box.viewRange()[0]
+    assert low <= float(window.cursor_x1.value()) <= high
+    assert window._cursor_readouts["Δt"].text() != "—"
+
+
+def test_cancel_placement_stops_waiting_for_clicks(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window.toggle_x_cursors_action.setChecked(True)
+    assert window.cancel_placement_action.isEnabled()
+    assert "Cancelar colocación" in _menu_texts(window._build_plot_context_menu((0.0, 0.0)))
+
+    window.cancel_placement_action.trigger()
+
+    assert window._placing_cursor is None
+    assert window.show_x_cursors.isChecked() is False
+
+
+def test_copy_actions_put_tab_separated_tables_on_clipboard(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window._place_cursor_here("x1", 0.001)
+    window._place_cursor_here("x2", 0.003)
+
+    window.copy_cursor_measurements_action.trigger()
+    text = QApplication.clipboard().text()
+    assert "Δt\t0.002\ts" in text
+    assert "Canal\tEn X1\tEn X2\tDiferencia\tUnidad" in text
+
+    window._copy_point_values(0.002)
+    lines = QApplication.clipboard().text().splitlines()
+    assert lines[0] == "Magnitud\tValor\tUnidad"
+    assert lines[1].startswith("t\t") and lines[2].startswith("CH1\t")

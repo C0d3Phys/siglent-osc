@@ -67,7 +67,7 @@ está enfocado en la familia SIGLENT SDS1xx4X-E/U.
 - Atajos adicionales: `Ctrl+1/2/3` para los paneles de canales, herramientas y estadísticas;
   `X`/`Y` cursores; `C` traer cursores a la vista; `+`/`-` Time/div en pasos 1-2-5;
   `Ctrl++`/`Ctrl+-` amplitud; `A` Auto Y; `Z` zoom a X1–X2; `Ctrl+0` ver todo; `Ctrl+F` FFT;
-  `Ctrl+M` canal matemático; `Ctrl+Shift+O` referencia; `Ctrl+W` cerrar. La lista completa
+  `Ctrl+M` canal matemático; `Ctrl+Shift+O` referencia; `Ctrl+W` cerrar; `Ctrl+Shift+C` copiar mediciones; `Esc` cancelar colocación. La lista completa
   está en Ayuda → Atajos de teclado y ratón.
 
 ## Análisis de ciclo motor

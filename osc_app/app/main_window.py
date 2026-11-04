@@ -9,6 +9,7 @@ import pyqtgraph.exporters as pg_exporters
 from PySide6.QtCore import QObject, QPoint, QPointF, QSettings, QSize, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -1294,6 +1295,19 @@ class MainWindow(QMainWindow):
         self.bring_cursors_action.setEnabled(False)
         self.show_x_cursors.toggled.connect(self._update_cursor_actions)
         self.show_y_cursors.toggled.connect(self._update_cursor_actions)
+        self.cancel_placement_action = cursors_menu.addAction(
+            "Cancelar colocación", self._cancel_placement
+        )
+        self.cancel_placement_action.setShortcut("Esc")
+        self.cancel_placement_action.setEnabled(False)
+        self.copy_cursor_measurements_action = cursors_menu.addAction(
+            "Copiar mediciones de cursores", self._copy_cursor_measurements
+        )
+        self.copy_cursor_measurements_action.setShortcut("Ctrl+Shift+C")
+        self.copy_cursor_measurements_action.setToolTip(
+            "Copia Δt, ΔY y los valores por canal como tabla para pegar en Excel"
+        )
+        self.copy_cursor_measurements_action.setEnabled(False)
         cursors_menu.addSeparator()
         cursor_overlay_action = cursors_menu.addAction("Mostrar valores sobre la gráfica")
         cursor_overlay_action.setCheckable(True)
@@ -1376,15 +1390,23 @@ class MainWindow(QMainWindow):
         self.statistics.setRowCount(0)
         self.cursor_values.setRowCount(0)
         self.close_acquisition_action.setEnabled(False)
+        self._placing_cursor = None
+        self._placement_queue.clear()
         self._update_cursor_actions()
         self._refresh_status_summary()
         self.statusBar().showMessage("Adquisición cerrada")
 
     def _update_cursor_actions(self, *_args: object) -> None:
-        if hasattr(self, "bring_cursors_action"):
-            self.bring_cursors_action.setEnabled(
-                self._acquisition is not None and self._any_cursor_visible()
-            )
+        """Habilita las acciones de cursores según el estado actual."""
+        if not hasattr(self, "cancel_placement_action"):
+            return  # aún se está construyendo el menú
+        loaded = self._acquisition is not None
+        self.bring_cursors_action.setEnabled(loaded and self._any_cursor_visible())
+        self.zoom_region_action.setEnabled(loaded and self._x_cursors_ready())
+        self.copy_cursor_measurements_action.setEnabled(
+            loaded and (self._x_cursors_ready() or self._y_cursors_ready())
+        )
+        self.cancel_placement_action.setEnabled(self._placing_cursor is not None)
 
     def _bring_cursors_into_view(self) -> None:
         """Recoloca los cursores activos dentro de la zona visible.
@@ -2054,7 +2076,10 @@ class MainWindow(QMainWindow):
             return
         if event.button() == Qt.MouseButton.RightButton:
             event.accept()
-            self._show_plot_context_menu(event.screenPos().toPoint())
+            point = self.view_box.mapSceneToView(event.scenePos())
+            self._show_plot_context_menu(
+                event.screenPos().toPoint(), (float(point.x()), float(point.y()))
+            )
             return
         if (
             event.button() == Qt.MouseButton.LeftButton
@@ -2069,25 +2094,198 @@ class MainWindow(QMainWindow):
         self._place_requested_cursor(float(position.x()), float(position.y()))
         event.accept()
 
-    def _show_plot_context_menu(self, screen_position) -> None:
+    def _show_plot_context_menu(
+        self, screen_position, point: tuple[float, float] | None = None
+    ) -> None:
+        self._build_plot_context_menu(point).exec(screen_position)
+
+    def _build_plot_context_menu(self, point: tuple[float, float] | None) -> QMenu:
+        """Menú del clic derecho, según el punto pulsado y el estado actual.
+
+        Reutiliza las acciones del menú principal (mismo texto, atajo y estado
+        habilitado) y añade las que dependen del punto: colocar cursores ahí,
+        centrar la vista y copiar los valores de ese instante.
+        """
         menu = QMenu(self)
-        x_action = menu.addAction("Colocar cursores verticales X1/X2")
-        x_action.setCheckable(True)
-        x_action.setChecked(self.show_x_cursors.isChecked())
-        x_action.toggled.connect(self.show_x_cursors.setChecked)
-        y_action = menu.addAction("Colocar cursores horizontales Y1/Y2")
-        y_action.setCheckable(True)
-        y_action.setChecked(self.show_y_cursors.isChecked())
-        y_action.toggled.connect(self.show_y_cursors.setChecked)
+        if self._acquisition is None:
+            menu.addAction(self.open_action)
+            return menu
+
+        if point is not None:
+            time_value, y_value = point
+            header = menu.addAction(self._point_summary(time_value))
+            header.setEnabled(False)
+            menu.addSeparator()
+            for name in ("x1", "x2"):
+                menu.addAction(
+                    f"Colocar {name.upper()} aquí",
+                    lambda name=name: self._place_cursor_here(name, time_value),
+                )
+            if self.show_y_cursors.isChecked():
+                for name in ("y1", "y2"):
+                    menu.addAction(
+                        f"Colocar {name.upper()} aquí",
+                        lambda name=name: self._place_cursor_here(name, y_value),
+                    )
+            menu.addAction("Centrar la vista aquí", lambda: self._center_view_at(time_value))
+            menu.addSeparator()
+
+        menu.addAction(self.toggle_x_cursors_action)
+        menu.addAction(self.toggle_y_cursors_action)
+        menu.addAction(self.bring_cursors_action)
         menu.addSeparator()
-        menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
-        if self._cycle_reference is not None:
-            menu.addAction("Quitar ciclo motor", self._clear_cycle_reference)
+        menu.addAction(self.zoom_region_action)
+        menu.addAction(self.full_view_action)
+        menu.addAction(self.auto_y_action)
         menu.addSeparator()
-        menu.addAction("Auto Y", self._auto_y)
-        menu.addAction("Zoom a región X1–X2", self._zoom_to_region)
-        menu.addAction("Vista completa", self._show_full_view)
-        menu.exec(screen_position)
+        if point is not None:
+            menu.addAction(
+                "Copiar valores en este punto", lambda: self._copy_point_values(point[0])
+            )
+        menu.addAction(self.copy_cursor_measurements_action)
+        menu.addAction(self.save_image_action)
+        menu.addSeparator()
+        if self._placing_cursor is not None:
+            menu.addAction(self.cancel_placement_action)
+        menu.addAction(
+            self.clear_cycle_action
+            if self._cycle_reference is not None
+            else self.define_cycle_action
+        )
+        if self._reference_item is not None:
+            menu.addSeparator()
+            menu.addAction(self.compare_reference_action)
+            menu.addAction(self.remove_reference_action)
+        return menu
+
+    def _values_at(self, time_value: float) -> tuple[float, list[tuple[str, float, str]]]:
+        """Tiempo de la muestra más cercana y valor de cada canal visible."""
+        acquisition = self._acquisition
+        assert acquisition is not None
+        index = nearest_index(acquisition.time, time_value)
+        rows = [
+            (
+                acquisition.channels[channel].name,
+                float(self._displayed_samples(channel)[index]),
+                self._display_unit(channel),
+            )
+            for channel in self._visible_channel_indices()
+        ]
+        return float(acquisition.time[index]), rows
+
+    def _point_summary(self, time_value: float) -> str:
+        sample_time, rows = self._values_at(time_value)
+        parts = [f"t = {self._format_time(sample_time)}"]
+        parts.extend(f"{name} {self._format_value(value, unit)}" for name, value, unit in rows)
+        return "   ·   ".join(parts)
+
+    def _place_cursor_here(self, name: str, value: float) -> None:
+        """Coloca ``name`` (x1, x2, y1, y2) en ``value`` sin el modo de clics.
+
+        Si el par estaba apagado se enciende; si el otro cursor del par quedó
+        fuera de la vista, se acerca para que ambos se vean.
+        """
+        kind = name[0]
+        checkbox = self.show_x_cursors if kind == "x" else self.show_y_cursors
+        if not checkbox.isChecked():
+            checkbox.setChecked(True)
+        self._cancel_pair_placement(kind)
+        x_range, y_range = self.view_box.viewRange()
+        low, high = x_range if kind == "x" else y_range
+        if kind == "x":
+            first, second = self.cursor_x1, self.cursor_x2
+        else:
+            first, second = self.cursor_y1, self.cursor_y2
+        target, other = (first, second) if name.endswith("1") else (second, first)
+        target.setValue(value)
+        other_value = float(other.value())
+        if not low <= other_value <= high or other_value == value:
+            offset = (high - low) * 0.1
+            other.setValue(value + offset if name.endswith("1") else value - offset)
+        first.show()
+        second.show()
+        if kind == "x":
+            self.region.setRegion(sorted((float(first.value()), float(second.value()))))
+            self.region.show()
+            self._x_cursor_finished()
+        else:
+            self._refresh_measurements()
+        self.statusBar().showMessage(f"{name.upper()} colocado")
+
+    def _cancel_pair_placement(self, kind: str) -> None:
+        if kind in self._placement_queue:
+            self._placement_queue.remove(kind)
+        if self._placing_cursor is not None and self._placing_cursor.startswith(kind):
+            self._finish_cursor_placement()
+
+    def _cancel_placement(self) -> None:
+        """Interrumpe la colocación en curso (cursores o ciclo motor)."""
+        placing = self._placing_cursor
+        if placing is None:
+            return
+        if placing in ("x1", "x2"):
+            self.show_x_cursors.setChecked(False)
+        elif placing in ("y1", "y2"):
+            self.show_y_cursors.setChecked(False)
+        else:
+            self._pending_cycle_start = None
+            self._finish_cursor_placement()
+            self._refresh_measurements()
+        self.statusBar().showMessage("Colocación cancelada")
+
+    def _center_view_at(self, time_value: float) -> None:
+        low, high = self.view_box.viewRange()[0]
+        half = (high - low) / 2.0
+        self.view_box.disableAutoRange(axis="x")
+        self.plot.setXRange(time_value - half, time_value + half, padding=0)
+
+    def _copy_point_values(self, time_value: float) -> None:
+        sample_time, rows = self._values_at(time_value)
+        lines = ["Magnitud\tValor\tUnidad", f"t\t{sample_time:.9g}\ts"]
+        lines.extend(f"{name}\t{value:.9g}\t{unit}" for name, value, unit in rows)
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Valores del punto copiados al portapapeles")
+
+    def _copy_cursor_measurements(self) -> None:
+        """Copia las mediciones de cursores como tabla separada por tabuladores."""
+        acquisition = self._acquisition
+        if acquisition is None:
+            return
+        lines = ["Magnitud\tValor\tUnidad"]
+        if self._x_cursors_ready():
+            time1 = float(self.cursor_x1.value())
+            time2 = float(self.cursor_x2.value())
+            delta = abs(time2 - time1)
+            lines += [
+                f"X1\t{time1:.9g}\ts",
+                f"X2\t{time2:.9g}\ts",
+                f"Δt\t{delta:.9g}\ts",
+            ]
+            if delta > 0:
+                lines.append(f"1/Δt\t{1.0 / delta:.9g}\tHz")
+        if self._y_cursors_ready():
+            unit = "PSI" if self._pressure_mode_active else "V"
+            y1 = float(self.cursor_y1.value())
+            y2 = float(self.cursor_y2.value())
+            lines += [
+                f"Y1\t{y1:.9g}\t{unit}",
+                f"Y2\t{y2:.9g}\t{unit}",
+                f"ΔY\t{abs(y2 - y1):.9g}\t{unit}",
+            ]
+        if self._x_cursors_ready():
+            index1 = nearest_index(acquisition.time, float(self.cursor_x1.value()))
+            index2 = nearest_index(acquisition.time, float(self.cursor_x2.value()))
+            lines += ["", "Canal\tEn X1\tEn X2\tDiferencia\tUnidad"]
+            for channel in self._visible_channel_indices():
+                samples = self._displayed_samples(channel)
+                value1 = float(samples[index1])
+                value2 = float(samples[index2])
+                lines.append(
+                    f"{acquisition.channels[channel].name}\t{value1:.9g}\t{value2:.9g}"
+                    f"\t{value2 - value1:.9g}\t{self._display_unit(channel)}"
+                )
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage("Mediciones de cursores copiadas al portapapeles")
 
     def _set_cursor_overlay_visible(self, visible: bool) -> None:
         self._show_cursor_overlay = visible
@@ -3139,6 +3337,7 @@ class MainWindow(QMainWindow):
             self._finish_cursor_placement()
 
     def _refresh_measurements(self) -> None:
+        self._update_cursor_actions()
         acquisition = self._acquisition
         if acquisition is None:
             return
@@ -3582,6 +3781,10 @@ class MainWindow(QMainWindow):
 
     def _zoom_to_region(self) -> None:
         if self._acquisition is None:
+            return
+        if not self._x_cursors_ready():
+            # Sin cursores X colocados la región es invisible o antigua: no saltar.
+            self.statusBar().showMessage("Coloque primero los cursores X1 y X2 (tecla X)")
             return
         start, end = sorted(self.region.getRegion())
         if end > start:

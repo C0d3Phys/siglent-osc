@@ -8,12 +8,20 @@ estable.
 
 ### Corregido
 
+- Zoom a región X1–X2 (menú, tecla `Z`, botón y clic derecho) ampliaba hacia una región
+  invisible cuando los cursores X estaban apagados; ahora se deshabilita hasta colocarlos.
 - Activar los cursores X y luego los Y antes de colocarlos dejaba los X ocultos; ahora se
   colocan ambos pares en orden. Mientras un par no está colocado, sus resultados muestran
   `—` en vez de valores de posiciones antiguas.
 
 ### Agregado
 
+- Menú contextual de la gráfica según el punto pulsado: muestra el tiempo y el valor de cada
+  canal en ese instante, permite colocar X1/X2/Y1/Y2 ahí, centrar la vista y copiar los
+  valores. Reutiliza las acciones del menú principal (con sus atajos) y solo muestra
+  Cancelar colocación o Comparar/Quitar referencia cuando aplican.
+- Cursores → Copiar mediciones de cursores (`Ctrl+Shift+C`), como tabla para pegar en Excel,
+  y Cancelar colocación (`Esc`).
 - Archivo → Cerrar adquisición (`Ctrl+W`), Cursores → Traer cursores a la vista y menú
   Ayuda con atajos de teclado y ratón, formatos compatibles y versión.
 - Barra de herramientas con íconos y tooltips para las acciones más usadas (abrir, guardar
