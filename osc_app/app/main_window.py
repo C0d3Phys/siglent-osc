@@ -63,7 +63,15 @@ from osc_app.core.measurements import (
 )
 from osc_app.core.models import Acquisition
 from osc_app.core.quantity import format_quantity, parse_quantity
-from osc_app.core.recent_files import MAX_RECENT_FILES, filter_existing_paths, push_recent_file
+from osc_app import __version__
+from osc_app.core.recent_files import (
+    MAX_RECENT_FILES,
+    dedupe_paths,
+    filter_existing_paths,
+    path_identity,
+    push_recent_file,
+    recent_file_label,
+)
 from osc_app.core.references import compare_reference, reference_time_shift, transform_reference
 from osc_app.core.siglent_bin_importer import BinImportError, SiglentBinImporter
 from osc_app.core.siglent_slg_importer import SiglentSlgImporter, SlgImportError
@@ -785,7 +793,7 @@ class MainWindow(QMainWindow):
         self.main_splitter.setCollapsible(1, True)
         self.statistics_panel.hide()
 
-        self.info = QLabel("Abra un CSV para comenzar.")
+        self.info = QLabel("Abra una adquisición para comenzar (Ctrl+O o arrastre un archivo).")
         self.info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout = QVBoxLayout()
         layout.addWidget(self.main_splitter, 1)
@@ -802,7 +810,6 @@ class MainWindow(QMainWindow):
         self.view_box.zoom_extended_callback = self._show_full_view
         plot_item = pg.PlotItem(viewBox=self.view_box)
         self.plot_item = plot_item
-        self.graph_navigation_menu = self.view_box.menu
         plot_item.setMenuEnabled(False)
         self.plot = pg.PlotWidget(background="#101419", plotItem=plot_item)
         self.plot.showGrid(x=True, y=True, alpha=0.25)
@@ -1148,12 +1155,18 @@ class MainWindow(QMainWindow):
         self.hantek_action.triggered.connect(self.choose_hantek_capture)
         self.recent_files_menu = file_menu.addMenu("Abrir &reciente")
         self.recent_files_menu.aboutToShow.connect(self._rebuild_recent_files_menu)
+        self.recent_files_menu.setToolTipsVisible(True)
         file_menu.addSeparator()
         self.save_image_action = file_menu.addAction("&Guardar imagen…")
         self.save_image_action.setIconText("Imagen")
         self.save_image_action.setShortcut("Ctrl+S")
         self.save_image_action.setToolTip("Guardar la gráfica actual como PNG (Ctrl+S)")
         self.save_image_action.triggered.connect(self.save_plot_image)
+        self.close_acquisition_action = file_menu.addAction(
+            "&Cerrar adquisición", self.close_acquisition
+        )
+        self.close_acquisition_action.setShortcut("Ctrl+W")
+        self.close_acquisition_action.setEnabled(False)
         file_menu.addSeparator()
         file_menu.addAction("&Salir", self.close)
 
@@ -1191,21 +1204,16 @@ class MainWindow(QMainWindow):
         self.statistics_panel_action.setToolTip("Mostrar u ocultar la tabla de estadísticas (Ctrl+3)")
         self.statistics_panel_action.toggled.connect(self._set_statistics_panel_visible)
         view_menu.addSeparator()
-        cursor_overlay_action = view_menu.addAction("Tabla superpuesta de cursores")
-        cursor_overlay_action.setCheckable(True)
-        cursor_overlay_action.setChecked(self._show_cursor_overlay)
-        cursor_overlay_action.toggled.connect(self._set_cursor_overlay_visible)
-        stats_overlay_action = view_menu.addAction("Tabla superpuesta de estadísticas")
+        stats_overlay_action = view_menu.addAction("Mostrar estadísticas sobre la gráfica")
         stats_overlay_action.setCheckable(True)
         stats_overlay_action.setChecked(self._show_stats_overlay)
         stats_overlay_action.toggled.connect(self._set_stats_overlay_visible)
-        view_menu.addSeparator()
-        self.graph_navigation_menu.setTitle("Navegación y ejes")
-        self._translate_plot_menu(self.graph_navigation_menu)
-        self.plot_item.ctrlMenu.setTitle("Opciones de trazado")
-        self._translate_plot_menu(self.plot_item.ctrlMenu)
-        view_menu.addMenu(self.graph_navigation_menu)
-        view_menu.addMenu(self.plot_item.ctrlMenu)
+        self.grid_action = view_menu.addAction("Cuadrícula")
+        self.grid_action.setCheckable(True)
+        self.grid_action.setChecked(True)
+        self.grid_action.toggled.connect(
+            lambda visible: self.plot.showGrid(x=visible, y=visible, alpha=0.25)
+        )
 
         channels_menu = self.menuBar().addMenu("&Canales")
         channels_menu.addAction("Mostrar todos", self._show_all_channels)
@@ -1246,7 +1254,20 @@ class MainWindow(QMainWindow):
         self.toggle_y_cursors_action.setToolTip("Mostrar u ocultar cursores Y1/Y2 (Ctrl+5)")
         self.toggle_y_cursors_action.toggled.connect(self.show_y_cursors.setChecked)
         self.show_y_cursors.toggled.connect(self.toggle_y_cursors_action.setChecked)
+        self.bring_cursors_action = cursors_menu.addAction(
+            "Traer cursores a la vista", self._bring_cursors_into_view
+        )
+        self.bring_cursors_action.setToolTip(
+            "Coloca los cursores activos dentro de la zona visible de la gráfica"
+        )
+        self.bring_cursors_action.setEnabled(False)
+        self.show_x_cursors.toggled.connect(self._update_cursor_actions)
+        self.show_y_cursors.toggled.connect(self._update_cursor_actions)
         cursors_menu.addSeparator()
+        cursor_overlay_action = cursors_menu.addAction("Mostrar valores sobre la gráfica")
+        cursor_overlay_action.setCheckable(True)
+        cursor_overlay_action.setChecked(self._show_cursor_overlay)
+        cursor_overlay_action.toggled.connect(self._set_cursor_overlay_visible)
         for checkbox in (self.snap_x_to_samples, self.lock_x_cursors):
             action = cursors_menu.addAction(checkbox.text())
             action.setCheckable(True)
@@ -1275,10 +1296,146 @@ class MainWindow(QMainWindow):
         )
         self.remove_reference_action.setEnabled(False)
         analysis_menu.addSeparator()
-        analysis_menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
-        analysis_menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
+        self.define_cycle_action = analysis_menu.addAction(
+            "Definir ciclo motor 0°–720°", self._begin_cycle_reference
+        )
+        self.clear_cycle_action = analysis_menu.addAction(
+            "Quitar ciclo motor", self._clear_cycle_reference
+        )
+        self.clear_cycle_action.setEnabled(False)
         analysis_menu.addSeparator()
         analysis_menu.addAction("Pruebas automotrices guiadas…", self._show_guided_tests)
+
+        help_menu = self.menuBar().addMenu("Ay&uda")
+        help_menu.addAction("Atajos de teclado y ratón…", self._show_shortcuts_help)
+        help_menu.addAction("Formatos compatibles…", self._show_formats_help)
+        help_menu.addSeparator()
+        help_menu.addAction("Acerca de OSC App…", self._show_about)
+
+    def close_acquisition(self) -> None:
+        """Descarta la adquisición abierta y deja la ventana como al iniciar."""
+        if self._acquisition is None:
+            return
+        self._import_request_id += 1  # ignora una importación que siga en curso
+        self.show_x_cursors.setChecked(False)
+        self.show_y_cursors.setChecked(False)
+        self._remove_reference()
+        self._remove_math_channels()
+        self._clear_cycle_reference()
+        self.pressure_enabled.setChecked(False)
+        self._acquisition = None
+        self._current_file_name = None
+        self.plot.clear()
+        self._plot_items.clear()
+        for tag in self._channel_offset_tags:
+            tag.deleteLater()
+        self._channel_offset_tags.clear()
+        self._clear_channel_cards()
+        for values in (
+            self._channel_checks,
+            self._native_probe_factors,
+            self._applied_probe_factors,
+            self._probe_controls,
+            self._offset_controls,
+        ):
+            values.clear()
+        self.statistics.setRowCount(0)
+        self.cursor_values.setRowCount(0)
+        self.close_acquisition_action.setEnabled(False)
+        self._update_cursor_actions()
+        self._refresh_status_summary()
+        self.statusBar().showMessage("Adquisición cerrada")
+
+    def _update_cursor_actions(self, *_args: object) -> None:
+        if hasattr(self, "bring_cursors_action"):
+            self.bring_cursors_action.setEnabled(
+                self._acquisition is not None and self._any_cursor_visible()
+            )
+
+    def _bring_cursors_into_view(self) -> None:
+        """Recoloca los cursores activos dentro de la zona visible.
+
+        Útil tras un zoom que deja X1/X2 o Y1/Y2 fuera de la pantalla.
+        """
+        if self._acquisition is None:
+            return
+        (x_low, x_high), (y_low, y_high) = self.plot.getViewBox().viewRange()
+        if self.show_x_cursors.isChecked():
+            if self._placing_cursor in ("x1", "x2") or "x" in self._placement_queue:
+                if "x" in self._placement_queue:
+                    self._placement_queue.remove("x")
+                if self._placing_cursor in ("x1", "x2"):
+                    self._placing_cursor = None
+            x1 = x_low + (x_high - x_low) * 0.25
+            x2 = x_low + (x_high - x_low) * 0.75
+            self.cursor_x1.setValue(x1)
+            self.cursor_x2.setValue(x2)
+            self.region.setRegion((x1, x2))
+            for item in (self.cursor_x1, self.cursor_x2, self.region):
+                item.show()
+            self._x_cursor_finished()
+        if self.show_y_cursors.isChecked():
+            if "y" in self._placement_queue:
+                self._placement_queue.remove("y")
+            if self._placing_cursor in ("y1", "y2"):
+                self._placing_cursor = None
+            self.cursor_y1.setValue(y_low + (y_high - y_low) * 0.35)
+            self.cursor_y2.setValue(y_low + (y_high - y_low) * 0.65)
+            self.cursor_y1.show()
+            self.cursor_y2.show()
+        self._refresh_measurements()
+        self.statusBar().showMessage("Cursores colocados en la zona visible")
+
+    def _show_shortcuts_help(self) -> None:
+        rows: list[tuple[str, str]] = []
+
+        def collect(menu: QMenu) -> None:
+            for action in menu.actions():
+                if action.menu() is not None:
+                    collect(action.menu())
+                elif action.shortcut().toString():
+                    rows.append(
+                        (action.shortcut().toString(), action.text().replace("&", "").rstrip("…"))
+                    )
+
+        for top_action in self.menuBar().actions():
+            if top_action.menu() is not None:
+                collect(top_action.menu())
+        mouse_rows = (
+            ("Rueda", "Zoom horizontal en pasos 1-2-5"),
+            ("Arrastrar", "Desplazar la vista"),
+            ("Clic derecho", "Menú de cursores y vista"),
+            ("Ctrl + arrastrar", "Mover la señal de referencia seleccionada"),
+            ("Arrastrar etiqueta C1…", "Offset visual del canal"),
+        )
+        table = "".join(
+            f"<tr><td style='padding-right:18px'><b>{key}</b></td><td>{text}</td></tr>"
+            for key, text in (*rows, ("", ""), *mouse_rows)
+        )
+        QMessageBox.information(
+            self, "Atajos de teclado y ratón", f"<table cellpadding='3'>{table}</table>"
+        )
+
+    def _show_formats_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "Formatos compatibles",
+            "<table cellpadding='3'>"
+            "<tr><td><b>.csv</b></td><td>Columna de tiempo y canales CH1–CH4</td></tr>"
+            "<tr><td><b>.bin</b></td><td>SIGLENT BIN moderno de 8 bits</td></tr>"
+            "<tr><td><b>.slg</b></td><td>SIGLENT registro largo (SPLG), experimental</td></tr>"
+            "<tr><td><b>.lwf</b></td><td>Hantek LWF binario, experimental</td></tr>"
+            "</table><p>Abra con Ctrl+O o arrastre el archivo sobre la ventana.</p>",
+        )
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "Acerca de OSC App",
+            f"<h3>OSC App {__version__}</h3>"
+            "<p>Visor y analizador de capturas de osciloscopio: cursores, mediciones, "
+            "FFT, canales matemáticos, referencia y pruebas automotrices.</p>",
+        )
 
     def _show_pressure_settings(self) -> None:
         self._set_cursor_panel_visible(True)
@@ -1340,27 +1497,7 @@ class MainWindow(QMainWindow):
         self.toolbar_toggle_action.setToolTip(
             "Mostrar u ocultar la barra de herramientas superior"
         )
-        self.view_menu.insertAction(self._view_menu_panels_separator, self.toolbar_toggle_action)
-
-    @staticmethod
-    def _translate_plot_menu(menu: QMenu) -> None:
-        translations = {
-            "View All": "Ver todo",
-            "X axis": "Eje X",
-            "Y axis": "Eje Y",
-            "Mouse Mode": "Modo del ratón",
-            "Transforms": "Transformaciones",
-            "Downsample": "Reducción de muestras",
-            "Average": "Promedio",
-            "Alpha": "Transparencia",
-            "Grid": "Cuadrícula",
-            "Points": "Puntos",
-        }
-        for action in menu.actions():
-            if action.text() in translations:
-                action.setText(translations[action.text()])
-            if action.menu() is not None:
-                MainWindow._translate_plot_menu(action.menu())
+        self.view_menu.insertAction(self.channel_panel_action, self.toolbar_toggle_action)
 
     def _set_channel_panel_visible(self, visible: bool) -> None:
         self.channel_panel.setVisible(visible)
@@ -1463,7 +1600,7 @@ class MainWindow(QMainWindow):
         if not stored:
             return []
         paths = list(stored) if isinstance(stored, list) else [stored]
-        existing = filter_existing_paths(paths, os.path.exists)
+        existing = dedupe_paths(filter_existing_paths(paths, os.path.exists), path_identity)
         if existing != paths:
             self._settings.setValue("recent_files", existing)
         return existing
@@ -1471,7 +1608,9 @@ class MainWindow(QMainWindow):
     def _remember_recent_file(self, path: Path) -> None:
         stored = self._settings.value("recent_files", [])
         existing = list(stored) if isinstance(stored, list) else ([stored] if stored else [])
-        updated = push_recent_file(existing, str(path), limit=MAX_RECENT_FILES)
+        updated = push_recent_file(
+            existing, os.path.realpath(path), limit=MAX_RECENT_FILES, key=path_identity
+        )
         self._settings.setValue("recent_files", updated)
 
     def _clear_recent_files(self) -> None:
@@ -1486,8 +1625,9 @@ class MainWindow(QMainWindow):
             return
         for path_text in recent:
             path = Path(path_text)
-            action = self.recent_files_menu.addAction(path.name)
+            action = self.recent_files_menu.addAction(recent_file_label(path_text))
             action.setToolTip(path_text)
+            action.setStatusTip(path_text)
             action.triggered.connect(lambda checked=False, p=path: self.open_file(p))
         self.recent_files_menu.addSeparator()
         self.recent_files_menu.addAction("Limpiar lista", self._clear_recent_files)
@@ -1869,7 +2009,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Definir ciclo motor 0°–720°", self._begin_cycle_reference)
         if self._cycle_reference is not None:
-            menu.addAction("Quitar referencia angular", self._clear_cycle_reference)
+            menu.addAction("Quitar ciclo motor", self._clear_cycle_reference)
         menu.addSeparator()
         menu.addAction("Auto Y", self._auto_y)
         menu.addAction("Zoom a región X1–X2", self._zoom_to_region)
@@ -1993,6 +2133,8 @@ class MainWindow(QMainWindow):
         self._initialize_selection()
         self._current_file_name = path.name
         self._remember_recent_file(path)
+        self.close_acquisition_action.setEnabled(True)
+        self._update_cursor_actions()
         self._refresh_status_summary()
         self.statusBar().showMessage(
             f"Importación completa: {accepted:,} muestras por canal"
@@ -2002,7 +2144,7 @@ class MainWindow(QMainWindow):
         """Actualiza el resumen permanente (archivo, muestras, tasa, canales, memoria)."""
         acquisition = self._acquisition
         if acquisition is None:
-            self.info.setText("Abra un CSV para comenzar.")
+            self.info.setText("Abra una adquisición para comenzar (Ctrl+O o arrastre un archivo).")
             return
         active_channels = len(self._visible_channel_indices())
         summary = build_status_summary(
@@ -2659,6 +2801,8 @@ class MainWindow(QMainWindow):
             ):
                 phase_region.hide()
                 phase_label.hide()
+        if hasattr(self, "clear_cycle_action"):
+            self.clear_cycle_action.setEnabled(False)
         if hasattr(self, "clear_cycle_button"):
             self.clear_cycle_button.setEnabled(False)
             self.cycle_summary.setText("Sin referencia angular")
@@ -2682,6 +2826,7 @@ class MainWindow(QMainWindow):
             f"Ciclo: {self._format_time(duration)} · {rpm:,.1f} RPM · 180° por etapa"
         )
         self.clear_cycle_button.setEnabled(True)
+        self.clear_cycle_action.setEnabled(True)
         self._update_cycle_phases()
         self._update_cycle_overlay()
         for index, (phase_region, phase_label) in enumerate(

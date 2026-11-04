@@ -14,6 +14,8 @@ estable.
 
 ### Agregado
 
+- Archivo → Cerrar adquisición (`Ctrl+W`), Cursores → Traer cursores a la vista y menú
+  Ayuda con atajos de teclado y ratón, formatos compatibles y versión.
 - Barra de herramientas con íconos y tooltips para las acciones más usadas (abrir, guardar
   imagen, cursores X/Y, Auto Y, zoom a región, vista completa, canal matemático, FFT).
 - Arrastrar y soltar archivos `.csv`, `.bin` o `.lwf` sobre la ventana principal.
@@ -31,6 +33,11 @@ estable.
 
 ### Cambiado
 
+- Menús reorganizados: se quitaron los submenús internos de pyqtgraph de Ver (podían
+  desincronizar Trazo/Dibujo y las mediciones) y se añadió la opción Cuadrícula; las
+  opciones que dependen del estado se deshabilitan cuando no aplican (Quitar ciclo motor).
+- "Abrir reciente" muestra el nombre y la carpeta de cada archivo, y ya no repite el mismo
+  archivo abierto con ruta corta de Windows (`ING_CE~1`) y ruta larga.
 - Pestaña Cursores reorganizada en bloques Tiempo (X1/X2) y Amplitud (Y1/Y2): cada posición
   se escribe y se lee en el mismo campo, con unidades automáticas (`12.5 ms`, `250 µs`), y
   cabe sin desplazarse. Las filas de grados solo aparecen con ciclo motor definido.

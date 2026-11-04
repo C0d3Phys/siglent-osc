@@ -154,7 +154,7 @@ def test_recent_files_menu_offers_clear_and_reopen(window, qapp, sample_csv) -> 
     window._rebuild_recent_files_menu()
     labels = [action.text() for action in window.recent_files_menu.actions()]
 
-    assert sample_csv.name in labels
+    assert any(label.startswith(f"{sample_csv.name}   —   ") for label in labels)
     assert "Limpiar lista" in labels
 
     window._clear_recent_files()
@@ -293,3 +293,82 @@ def test_cursor_field_accepts_values_with_si_prefix(window, qapp, sample_csv) ->
     window.x2_numeric.editingFinished.emit()
     assert float(window.cursor_x2.value()) == pytest.approx(0.0025)
     assert window.x2_numeric.text() == "2.50000 ms"
+
+
+def _all_menu_texts(window) -> list[str]:
+    texts: list[str] = []
+
+    def collect(menu) -> None:
+        for action in menu.actions():
+            texts.append(action.text())
+            if action.menu() is not None:
+                collect(action.menu())
+
+    for top in window.menuBar().actions():
+        texts.append(top.text())
+        collect(top.menu())
+    return texts
+
+
+def test_menus_do_not_expose_internal_plot_menus(window) -> None:
+    texts = _all_menu_texts(window)
+
+    for internal in ("Opciones de trazado", "Navegación y ejes", "3 button", "Transforms"):
+        assert internal not in texts
+    assert "Ay&uda" in texts
+
+
+def test_grid_option_toggles_plot_grid(window) -> None:
+    assert window.grid_action.isChecked()
+
+    window.grid_action.setChecked(False)
+
+    assert window.plot.getAxis("bottom").grid is False
+
+
+def test_clear_cycle_is_only_enabled_with_a_cycle(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    assert window.clear_cycle_action.isEnabled() is False
+
+    window._begin_cycle_reference()
+    window._place_requested_cursor(0.001, 0.0)
+    window._place_requested_cursor(0.003, 0.0)
+    assert window.clear_cycle_action.isEnabled() is True
+
+    window.clear_cycle_action.trigger()
+    assert window.clear_cycle_action.isEnabled() is False
+
+
+def test_close_acquisition_resets_the_window_and_allows_reopening(
+    window, qapp, sample_csv
+) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    assert window.close_acquisition_action.isEnabled()
+
+    window.close_acquisition_action.trigger()
+
+    assert window._acquisition is None
+    assert window.channel_cards == []
+    assert window._plot_items == []
+    assert window.close_acquisition_action.isEnabled() is False
+    assert "Abra una adquisición" in window.info.text()
+
+    _open_and_wait(window, qapp, sample_csv)
+    assert len(window.channel_cards) == 4
+
+
+def test_bring_cursors_into_view_places_them_inside_the_visible_range(
+    window, qapp, sample_csv
+) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window.toggle_x_cursors_action.setChecked(True)
+    window.toggle_y_cursors_action.setChecked(True)
+    assert window.bring_cursors_action.isEnabled()
+
+    window.bring_cursors_action.trigger()
+
+    (x_low, x_high), (y_low, y_high) = window.plot.getViewBox().viewRange()
+    assert x_low < float(window.cursor_x1.value()) < float(window.cursor_x2.value()) < x_high
+    assert y_low < float(window.cursor_y1.value()) < float(window.cursor_y2.value()) < y_high
+    assert window._placing_cursor is None
+    assert window._cursor_readouts["Δt"].text() != "—"
