@@ -580,6 +580,13 @@ class MainWindow(QMainWindow):
             "Picos conserva extremos; Promedio visual reduce el ruido aparente sin cambiar los datos"
         )
         self.display_mode.currentIndexChanged.connect(self._change_display_mode)
+        self.draw_style = QComboBox()
+        self.draw_style.addItem("Vectores", "vectors")
+        self.draw_style.addItem("Puntos", "dots")
+        self.draw_style.setToolTip(
+            "Vectores une las muestras con líneas; Puntos dibuja solo las muestras"
+        )
+        self.draw_style.currentIndexChanged.connect(self._change_draw_style)
         auto_y_button = QPushButton("Auto Y")
         auto_y_button.setToolTip("Ajustar la escala vertical a los canales visibles")
         auto_y_button.clicked.connect(self._auto_y)
@@ -598,6 +605,8 @@ class MainWindow(QMainWindow):
         graph_buttons.addWidget(self.time_div_label)
         graph_buttons.addWidget(QLabel("Trazo:"))
         graph_buttons.addWidget(self.display_mode)
+        graph_buttons.addWidget(QLabel("Dibujo:"))
+        graph_buttons.addWidget(self.draw_style)
         graph_buttons.addStretch(1)
         graph_buttons.addWidget(auto_y_button)
         graph_buttons.addWidget(zoom_y_in_button)
@@ -1608,6 +1617,7 @@ class MainWindow(QMainWindow):
             name=f"{name} [{unit}]",
         )
         item.setDownsampling(auto=True, method=str(self.display_mode.currentData()))
+        self._apply_draw_style(item)
         self._math_items.append(item)
         self._math_results.append(samples)
         self._math_names.append(name)
@@ -1894,6 +1904,7 @@ class MainWindow(QMainWindow):
                 pen=pg.mkPen(CHANNEL_COLORS[row % len(CHANNEL_COLORS)], width=1),
                 name=channel.name,
             )
+            self._apply_draw_style(item)
             self._plot_items.append(item)
             tag = ChannelOffsetTag(
                 self.plot,
@@ -3127,6 +3138,30 @@ class MainWindow(QMainWindow):
         self.plot.setDownsampling(auto=True, mode=mode)
         for item in self._plot_items:
             item.setDownsampling(auto=True, method=mode)
+
+    def _change_draw_style(self, *_args: object) -> None:
+        for item in (*self._plot_items, *self._math_items):
+            self._apply_draw_style(item)
+
+    def _apply_draw_style(self, item: pg.PlotDataItem) -> None:
+        """Dibuja ``item`` como vectores (líneas) o como puntos sueltos.
+
+        El lápiz original se guarda en el ítem para restaurarlo al volver a
+        vectores; en modo puntos el color del lápiz pasa al relleno del punto.
+        """
+        line_pen = getattr(item, "_osc_line_pen", None)
+        if line_pen is None:
+            line_pen = pg.mkPen(item.opts["pen"])
+            item._osc_line_pen = line_pen
+        if self.draw_style.currentData() == "dots":
+            item.setPen(None)
+            item.setSymbol("o")
+            item.setSymbolSize(3)
+            item.setSymbolPen(None)
+            item.setSymbolBrush(line_pen.color())
+        else:
+            item.setSymbol(None)
+            item.setPen(line_pen)
 
     def _update_time_div_label(self, *_args: object) -> None:
         low, high = self.view_box.viewRange()[0]

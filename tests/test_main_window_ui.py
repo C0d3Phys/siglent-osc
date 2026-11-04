@@ -16,7 +16,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QMimeData, QSettings, QUrl
+from PySide6.QtCore import QMimeData, QSettings, Qt, QUrl
 from PySide6.QtWidgets import QApplication
 
 from osc_app.app.main_window import MainWindow
@@ -184,3 +184,19 @@ def test_drop_path_accepts_supported_extension_and_rejects_others(window) -> Non
 
     assert window._acceptable_drop_path(accepted) == Path("/tmp/example.csv")
     assert window._acceptable_drop_path(rejected) is None
+
+
+def test_draw_style_switches_between_vectors_and_dots(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    item = window._plot_items[0]
+    line_color = item.opts["pen"].color()
+    assert item.opts["symbol"] is None
+
+    window.draw_style.setCurrentIndex(window.draw_style.findData("dots"))
+    assert item.opts["symbol"] == "o"
+    assert item.opts["pen"].style() == Qt.PenStyle.NoPen
+    assert item.opts["symbolBrush"].color() == line_color
+
+    window.draw_style.setCurrentIndex(window.draw_style.findData("vectors"))
+    assert item.opts["symbol"] is None
+    assert item.opts["pen"].color() == line_color
