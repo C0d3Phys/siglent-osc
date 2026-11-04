@@ -372,3 +372,41 @@ def test_bring_cursors_into_view_places_them_inside_the_visible_range(
     assert y_low < float(window.cursor_y1.value()) < float(window.cursor_y2.value()) < y_high
     assert window._placing_cursor is None
     assert window._cursor_readouts["Δt"].text() != "—"
+
+
+def test_time_zoom_buttons_step_time_division_in_1_2_5(window, qapp, sample_csv) -> None:
+    _open_and_wait(window, qapp, sample_csv)
+    window.plot.setXRange(0.0, 14 * 1e-3, padding=0)  # 1 ms/div
+
+    window.zoom_x_in_action.trigger()
+    low, high = window.view_box.viewRange()[0]
+    assert (high - low) / 14 == pytest.approx(0.5e-3)
+
+    window.zoom_x_out_action.trigger()
+    window.zoom_x_out_action.trigger()
+    low, high = window.view_box.viewRange()[0]
+    assert (high - low) / 14 == pytest.approx(2e-3)
+    assert (low + high) / 2 == pytest.approx(7e-3)
+
+
+def test_view_buttons_share_actions_and_shortcuts(window) -> None:
+    assert window._view_buttons["x_in"].defaultAction() is window.zoom_x_in_action
+    assert window._view_buttons["full_view"].text() == "Ver todo"
+    shortcuts = {
+        window.toggle_x_cursors_action: "X",
+        window.toggle_y_cursors_action: "Y",
+        window.auto_y_action: "A",
+        window.zoom_region_action: "Z",
+        window.zoom_x_in_action: "+",
+        window.zoom_x_out_action: "-",
+        window.bring_cursors_action: "C",
+    }
+    for action, expected in shortcuts.items():
+        assert action.shortcut().toString() == expected
+
+
+def test_open_button_offers_recent_files(window) -> None:
+    open_button = window.main_toolbar.widgetForAction(window.open_action)
+
+    assert open_button.menu() is window.recent_files_menu
+    assert window.save_image_action.iconText() == "Guardar imagen"

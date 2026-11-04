@@ -33,6 +33,13 @@ estable.
 
 ### Cambiado
 
+- Barra bajo la gráfica agrupada en Amplitud (`Y−`, `Auto Y`, `Y+`) y Tiempo (`X−`, `X+`,
+  `Zoom X1–X2`, `Ver todo`); `X−`/`X+` cambian Time/div en pasos 1-2-5.
+- Barra superior: "Guardar imagen" con su nombre completo, íconos distintos para cada panel
+  y archivos recientes en la flecha del botón Abrir.
+- Atajos más fáciles de recordar: `X`/`Y` cursores, `C` traer cursores, `+`/`-` Time/div,
+  `Ctrl++`/`Ctrl+-` amplitud, `A` Auto Y, `Z` zoom a X1–X2, `Ctrl+Shift+O` referencia.
+  Sustituyen a `Ctrl+4/5`, `Ctrl+R` y `Ctrl+Y`.
 - Menús reorganizados: se quitaron los submenús internos de pyqtgraph de Ver (podían
   desincronizar Trazo/Dibujo y las mediciones) y se añadió la opción Cuadrícula; las
   opciones que dependen del estado se deshabilitan cuando no aplican (Quitar ciclo motor).

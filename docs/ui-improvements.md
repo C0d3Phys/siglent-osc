@@ -29,9 +29,10 @@ exitosa. El panel sigue pudiéndose ocultar manualmente; solo cambia el punto de
 ### Atajos de teclado adicionales
 
 Se añadieron atajos a acciones ya existentes en los menús (no se crearon acciones nuevas):
-`Ctrl+1/2/3` para los paneles de canales, herramientas y estadísticas; `Ctrl+4/5` para
-cursores X1/X2 y Y1/Y2; `Ctrl+F` para el analizador FFT; `Ctrl+M` para crear un canal
-matemático; `Ctrl+R` para zoom a región; `Ctrl+0` para vista completa; `Ctrl+Y` para Auto Y.
+`Ctrl+1/2/3` para los paneles de canales, herramientas y estadísticas; `X`/`Y` cursores; `C` traer cursores a la vista; `+`/`-` Time/div en pasos 1-2-5;
+`Ctrl++`/`Ctrl+-` amplitud; `A` Auto Y; `Z` zoom a X1–X2; `Ctrl+0` ver todo; `Ctrl+F` FFT;
+`Ctrl+M` canal matemático; `Ctrl+Shift+O` referencia; `Ctrl+W` cerrar. La lista completa
+está en Ayuda → Atajos de teclado y ratón.
 
 ### Arrastrar y soltar
 

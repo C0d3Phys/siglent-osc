@@ -7,7 +7,7 @@ import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.exporters as pg_exporters
 from PySide6.QtCore import QObject, QPoint, QPointF, QSettings, QSize, Qt, QThread, Signal
-from PySide6.QtGui import QActionGroup, QBrush, QColor, QPalette
+from PySide6.QtGui import QAction, QActionGroup, QBrush, QColor, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -721,32 +721,30 @@ class MainWindow(QMainWindow):
             "Vectores une las muestras con líneas; Puntos dibuja solo las muestras"
         )
         self.draw_style.currentIndexChanged.connect(self._change_draw_style)
-        auto_y_button = QPushButton("Auto Y")
-        auto_y_button.setToolTip("Ajustar la escala vertical a los canales visibles")
-        auto_y_button.clicked.connect(self._auto_y)
-        zoom_y_in_button = QPushButton("Y +")
-        zoom_y_in_button.setToolTip("Acercar la escala vertical")
-        zoom_y_in_button.clicked.connect(lambda: self._zoom_y(0.7))
-        zoom_y_out_button = QPushButton("Y −")
-        zoom_y_out_button.setToolTip("Alejar la escala vertical")
-        zoom_y_out_button.clicked.connect(lambda: self._zoom_y(1.4))
-        region_view_button = QPushButton("Región")
-        region_view_button.setToolTip("Ampliar la región delimitada por X1 y X2")
-        region_view_button.clicked.connect(self._zoom_to_region)
-        full_view_button = QPushButton("Todo")
-        full_view_button.setToolTip("Mostrar la adquisición completa")
-        full_view_button.clicked.connect(self._show_full_view)
+        # Los botones se enlazan a las acciones del menú Ver en _build_menu, así
+        # comparten texto, atajo y tooltip con el menú.
+        self._view_buttons = {
+            name: QToolButton()
+            for name in (
+                "y_out", "auto_y", "y_in", "x_out", "x_in", "zoom_region", "full_view"
+            )
+        }
+        for button in self._view_buttons.values():
+            button.setMinimumWidth(34)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         graph_buttons.addWidget(self.time_div_label)
         graph_buttons.addWidget(QLabel("Trazo:"))
         graph_buttons.addWidget(self.display_mode)
         graph_buttons.addWidget(QLabel("Dibujo:"))
         graph_buttons.addWidget(self.draw_style)
         graph_buttons.addStretch(1)
-        graph_buttons.addWidget(auto_y_button)
-        graph_buttons.addWidget(zoom_y_in_button)
-        graph_buttons.addWidget(zoom_y_out_button)
-        graph_buttons.addWidget(region_view_button)
-        graph_buttons.addWidget(full_view_button)
+        graph_buttons.addWidget(self._group_label("Amplitud"))
+        for name in ("y_out", "auto_y", "y_in"):
+            graph_buttons.addWidget(self._view_buttons[name])
+        graph_buttons.addSpacing(14)
+        graph_buttons.addWidget(self._group_label("Tiempo"))
+        for name in ("x_out", "x_in", "zoom_region", "full_view"):
+            graph_buttons.addWidget(self._view_buttons[name])
         graph_layout.addLayout(graph_buttons)
 
         self.upper_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1158,7 +1156,7 @@ class MainWindow(QMainWindow):
         self.recent_files_menu.setToolTipsVisible(True)
         file_menu.addSeparator()
         self.save_image_action = file_menu.addAction("&Guardar imagen…")
-        self.save_image_action.setIconText("Imagen")
+        self.save_image_action.setIconText("Guardar imagen")
         self.save_image_action.setShortcut("Ctrl+S")
         self.save_image_action.setToolTip("Guardar la gráfica actual como PNG (Ctrl+S)")
         self.save_image_action.triggered.connect(self.save_plot_image)
@@ -1172,15 +1170,47 @@ class MainWindow(QMainWindow):
 
         view_menu = self.menuBar().addMenu("&Ver")
         self.view_menu = view_menu
-        self.full_view_action = view_menu.addAction("Vista completa", self._show_full_view)
-        self.full_view_action.setShortcut("Ctrl+0")
-        self.full_view_action.setToolTip("Mostrar la adquisición completa (Ctrl+0)")
-        self.zoom_region_action = view_menu.addAction("Zoom a región X1–X2", self._zoom_to_region)
-        self.zoom_region_action.setShortcut("Ctrl+R")
-        self.zoom_region_action.setToolTip("Ampliar la región X1–X2 (Ctrl+R)")
-        self.auto_y_action = view_menu.addAction("Auto Y", self._auto_y)
-        self.auto_y_action.setShortcut("Ctrl+Y")
-        self.auto_y_action.setToolTip("Ajustar la escala vertical automáticamente (Ctrl+Y)")
+        self.full_view_action = self._view_action(
+            view_menu, "Ver todo", "Ver todo", ("Ctrl+0", "Home"),
+            "Mostrar la adquisición completa", self._show_full_view,
+        )
+        self.zoom_region_action = self._view_action(
+            view_menu, "Zoom a región X1–X2", "Zoom X1–X2", ("Z",),
+            "Ampliar la región entre los cursores X1 y X2", self._zoom_to_region,
+        )
+        view_menu.addSeparator()
+        self.zoom_x_in_action = self._view_action(
+            view_menu, "Acercar tiempo (menos s/div)", "X+", ("+", "="),
+            "Reducir Time/div al siguiente paso 1-2-5",
+            lambda: self._step_time_division(zoom_in=True),
+        )
+        self.zoom_x_out_action = self._view_action(
+            view_menu, "Alejar tiempo (más s/div)", "X−", ("-",),
+            "Aumentar Time/div al siguiente paso 1-2-5",
+            lambda: self._step_time_division(zoom_in=False),
+        )
+        self.zoom_y_in_action = self._view_action(
+            view_menu, "Acercar amplitud", "Y+", ("Ctrl++", "Ctrl+="),
+            "Ampliar la escala vertical", lambda: self._zoom_y(0.7),
+        )
+        self.zoom_y_out_action = self._view_action(
+            view_menu, "Alejar amplitud", "Y−", ("Ctrl+-",),
+            "Reducir la escala vertical", lambda: self._zoom_y(1.4),
+        )
+        self.auto_y_action = self._view_action(
+            view_menu, "Auto Y", "Auto Y", ("A",),
+            "Ajustar la escala vertical a los canales visibles", self._auto_y,
+        )
+        for name, action in (
+            ("y_out", self.zoom_y_out_action),
+            ("auto_y", self.auto_y_action),
+            ("y_in", self.zoom_y_in_action),
+            ("x_out", self.zoom_x_out_action),
+            ("x_in", self.zoom_x_in_action),
+            ("zoom_region", self.zoom_region_action),
+            ("full_view", self.full_view_action),
+        ):
+            self._view_buttons[name].setDefaultAction(action)
         self._view_menu_panels_separator = view_menu.addSeparator()
         self.channel_panel_action = view_menu.addAction("Panel de canales")
         self.channel_panel_action.setIconText("Canales")
@@ -1242,23 +1272,24 @@ class MainWindow(QMainWindow):
         self.toggle_x_cursors_action.setIconText("Cursores X")
         self.toggle_x_cursors_action.setCheckable(True)
         self.toggle_x_cursors_action.setChecked(self.show_x_cursors.isChecked())
-        self.toggle_x_cursors_action.setShortcut("Ctrl+4")
-        self.toggle_x_cursors_action.setToolTip("Mostrar u ocultar cursores X1/X2 (Ctrl+4)")
+        self.toggle_x_cursors_action.setShortcut("X")
+        self.toggle_x_cursors_action.setToolTip("Mostrar u ocultar cursores X1/X2 (X)")
         self.toggle_x_cursors_action.toggled.connect(self.show_x_cursors.setChecked)
         self.show_x_cursors.toggled.connect(self.toggle_x_cursors_action.setChecked)
         self.toggle_y_cursors_action = cursors_menu.addAction("Horizontales Y1/Y2")
         self.toggle_y_cursors_action.setIconText("Cursores Y")
         self.toggle_y_cursors_action.setCheckable(True)
         self.toggle_y_cursors_action.setChecked(self.show_y_cursors.isChecked())
-        self.toggle_y_cursors_action.setShortcut("Ctrl+5")
-        self.toggle_y_cursors_action.setToolTip("Mostrar u ocultar cursores Y1/Y2 (Ctrl+5)")
+        self.toggle_y_cursors_action.setShortcut("Y")
+        self.toggle_y_cursors_action.setToolTip("Mostrar u ocultar cursores Y1/Y2 (Y)")
         self.toggle_y_cursors_action.toggled.connect(self.show_y_cursors.setChecked)
         self.show_y_cursors.toggled.connect(self.toggle_y_cursors_action.setChecked)
         self.bring_cursors_action = cursors_menu.addAction(
             "Traer cursores a la vista", self._bring_cursors_into_view
         )
+        self.bring_cursors_action.setShortcut("C")
         self.bring_cursors_action.setToolTip(
-            "Coloca los cursores activos dentro de la zona visible de la gráfica"
+            "Coloca los cursores activos dentro de la zona visible de la gráfica (C)"
         )
         self.bring_cursors_action.setEnabled(False)
         self.show_x_cursors.toggled.connect(self._update_cursor_actions)
@@ -1286,7 +1317,10 @@ class MainWindow(QMainWindow):
             "Abrir señal de referencia…", self._choose_reference
         )
         self.open_reference_action.setIconText("Referencia")
-        self.open_reference_action.setToolTip("Superponer una señal de referencia")
+        self.open_reference_action.setShortcut("Ctrl+Shift+O")
+        self.open_reference_action.setToolTip(
+            "Superponer una señal de referencia (Ctrl+Shift+O)"
+        )
         self.compare_reference_action = analysis_menu.addAction(
             "Comparar con referencia…", self._compare_with_reference
         )
@@ -1437,6 +1471,39 @@ class MainWindow(QMainWindow):
             "FFT, canales matemáticos, referencia y pruebas automotrices.</p>",
         )
 
+    @staticmethod
+    def _group_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet("color: #b4bcc8;")
+        return label
+
+    def _view_action(
+        self,
+        menu: QMenu,
+        text: str,
+        short_text: str,
+        shortcuts: tuple[str, ...],
+        tip: str,
+        slot,
+    ) -> QAction:
+        """Acción de vista compartida por el menú Ver y la barra bajo la gráfica."""
+        action = menu.addAction(text, slot)
+        action.setIconText(short_text)
+        action.setShortcuts([QKeySequence(shortcut) for shortcut in shortcuts])
+        action.setToolTip(f"{tip} ({shortcuts[0]})")
+        return action
+
+    def _step_time_division(self, *, zoom_in: bool) -> None:
+        """Cambia Time/div al paso 1-2-5 siguiente, centrado en la vista actual."""
+        if self._acquisition is None:
+            return
+        low, high = self.view_box.viewRange()[0]
+        current = (high - low) / 14.0
+        target = next_125(current, zoom_in=zoom_in)
+        center = (low + high) / 2.0
+        self.view_box.disableAutoRange(axis="x")
+        self.plot.setXRange(center - target * 7.0, center + target * 7.0, padding=0)
+
     def _show_pressure_settings(self) -> None:
         self._set_cursor_panel_visible(True)
         self.tools_tabs.setCurrentWidget(self.pressure_tab)
@@ -1488,6 +1555,12 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.math_channel_action)
         toolbar.addAction(self.fft_action)
         toolbar.addAction(self.open_reference_action)
+
+        # Abrir: clic abre el diálogo; la flecha despliega los archivos recientes.
+        open_button = toolbar.widgetForAction(self.open_action)
+        if isinstance(open_button, QToolButton):
+            open_button.setMenu(self.recent_files_menu)
+            open_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
 
         self.main_toolbar = toolbar
         self.addToolBar(toolbar)

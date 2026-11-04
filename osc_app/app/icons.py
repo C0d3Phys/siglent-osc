@@ -152,18 +152,38 @@ def _draw_fft(painter: QPainter, rect: QRectF) -> None:
         painter.drawLine(QPointF(x, base), QPointF(x, top))
 
 
-def _draw_panel(painter: QPainter, rect: QRectF, side: str) -> None:
-    """Ventana con una franja resaltada en el lado indicado (panel lateral)."""
-    painter.drawRoundedRect(rect, 3, 3)
-    if side == "left":
-        x = rect.left() + rect.width() * 0.34
+def _draw_channel_list(painter: QPainter, rect: QRectF) -> None:
+    """Lista de canales: tres filas con casilla y renglón (panel Canales)."""
+    box = rect.width() * 0.20
+    for fraction in (0.18, 0.50, 0.82):
+        y = rect.top() + rect.height() * fraction
+        painter.drawRect(QRectF(rect.left(), y - box / 2, box, box))
+        painter.drawLine(
+            QPointF(rect.left() + box * 1.8, y), QPointF(rect.right(), y)
+        )
+
+
+def _draw_sliders(painter: QPainter, rect: QRectF) -> None:
+    """Tres controles deslizantes con perilla (panel Herramientas)."""
+    radius = rect.width() * 0.10
+    for fraction, knob in ((0.18, 0.30), (0.50, 0.70), (0.82, 0.45)):
+        y = rect.top() + rect.height() * fraction
+        x = rect.left() + rect.width() * knob
+        painter.drawLine(QPointF(rect.left(), y), QPointF(x - radius, y))
+        painter.drawLine(QPointF(x + radius, y), QPointF(rect.right(), y))
+        painter.drawEllipse(QPointF(x, y), radius, radius)
+
+
+def _draw_table(painter: QPainter, rect: QRectF) -> None:
+    """Tabla con encabezado y celdas (panel Estadísticas)."""
+    painter.drawRoundedRect(rect, 2, 2)
+    header = rect.top() + rect.height() * 0.30
+    painter.drawLine(QPointF(rect.left(), header), QPointF(rect.right(), header))
+    middle = rect.top() + rect.height() * 0.65
+    painter.drawLine(QPointF(rect.left(), middle), QPointF(rect.right(), middle))
+    for fraction in (0.36, 0.68):
+        x = rect.left() + rect.width() * fraction
         painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
-    elif side == "right":
-        x = rect.right() - rect.width() * 0.34
-        painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
-    else:
-        y = rect.bottom() - rect.height() * 0.34
-        painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
 
 
 def _draw_reference(painter: QPainter, rect: QRectF) -> None:
@@ -187,9 +207,9 @@ def _draw_reference(painter: QPainter, rect: QRectF) -> None:
 
 
 _DRAWERS: dict[str, Callable[[QPainter, QRectF], None]] = {
-    "panel_left": lambda painter, rect: _draw_panel(painter, rect, "left"),
-    "panel_right": lambda painter, rect: _draw_panel(painter, rect, "right"),
-    "panel_bottom": lambda painter, rect: _draw_panel(painter, rect, "bottom"),
+    "panel_left": _draw_channel_list,
+    "panel_right": _draw_sliders,
+    "panel_bottom": _draw_table,
     "reference": _draw_reference,
     "open": _draw_open,
     "save_image": _draw_save_image,
